@@ -8,10 +8,11 @@
 
 - 首版采用 Node.js + TypeScript 的模块化单体，生产环境使用 Telegram Webhook。
 - 不保存用户密码、`new-api` 用户 PAT 或模型 API Key。
-- 首选通过你们 `new-api` fork 中的 Telegram Bridge 按 Telegram ID 解析用户，Node 不保存用户 PAT。
-- 当前 `admin` 模式可用于测试现有官方路由：用户先在网页绑定 Telegram，再执行 `/bind <用户ID>`。
-- `new-api` 是余额、用量、订阅、支付和令牌的唯一数据源；Bot 只通过只读 Bridge 读取最小展示 DTO，绝不直连其数据库。
+- `admin` 是不修改原生 `new-api` 的默认模式：用户先在网页绑定 Telegram，再执行 `/bind <用户ID>`；Bot 只做账户、用量、订阅和公告读取。
+- `bridge` 是可选的现有集成模式：目标实例已经实现 Telegram Bridge 时，Bot 才能按 Telegram ID 解析用户并显示受限的 Key/收银台功能。Node 不保存用户 PAT。
+- `new-api` 是余额、用量、订阅、支付和令牌的唯一数据源；Bot 通过 scoped Bridge 读取最小展示 DTO，绝不直连其数据库。
 - Bot 不保存 `new-api` 的消费明细、订单、支付流水、额度账本、API Key、密码、PAT 或兑换码。
+- Telegram 充值已完成本地 Mock 与 focused contract：易支付订单展示 checkout URL/二维码；链上 USDT/USDC 订单只展示锁定的网络、币种和收款地址。订单、回调与入账全部由 `new-api` 处理；服务商沙箱与生产验收尚未完成。
 
 ## 文档
 
@@ -19,6 +20,8 @@
 - [系统架构](docs/02-architecture.md)
 - [开发计划](docs/03-development-plan.md)
 - [new-api 接口核对](docs/04-new-api-integration.md)
+- [Telegram 易支付充值计划](docs/05-telegram-epay-topup-plan.md)
+- [Mock 验收与后续开发](docs/06-mock-acceptance-and-delivery-plan.md)
 
 ## 当前实现
 
@@ -32,7 +35,7 @@ SQLite 只支持单 Bot 实例和本地持久卷，适合前期小规模部署�
 
 通知命令：`/settings`、`/notify <额度|off|pause|resume>`。客服命令：`/support <问题>`。管理员命令：`/admin`、`/broadcast <内容>`，管理员 ID 必须配置在 `BOT_ADMIN_TELEGRAM_IDS`。
 
-兑换、充值、支付、令牌创建/删除和额度调整不属于本机器人范围，应始终在 `new-api` 网页完成。
+在原生 `admin` 模式下，API Key 管理、充值、退款、补单和额度调整始终在 `new-api` 网页完成；Bot 会给出门户链接而不会尝试越权调用用户接口。`bridge` 模式中的 Key/充值界面仅能在该实例已完成对应服务端适配和验收后启用。链上稳定币仍只有 Mock，不能用于真实收款。
 
 ## 开发前待确认
 

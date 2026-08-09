@@ -3,7 +3,7 @@ export type TelegramUser = {
   chatId: string;
   username?: string;
   displayName?: string;
-  locale: 'zh' | 'en';
+  locale: import('./i18n.js').Locale;
 };
 
 export type AccountBinding = {
@@ -93,11 +93,109 @@ export type Subscription = {
   remainingAmount?: number;
 };
 
+export type AvailableModel = {
+  id: string;
+  endpointTypes: string[];
+};
+
+export type AvailableModelPage = {
+  models: AvailableModel[];
+  total: number;
+  nextCursor?: string;
+};
+
+export type ApiKeyProfile = {
+  id: string;
+  label: string;
+  autoGroups?: string[];
+};
+
+export type ApiAccess = {
+  baseUrl: string;
+  keyManagementUrl: string;
+  profiles: ApiKeyProfile[];
+  keyLimit: number;
+};
+
+export type ApiKey = {
+  id: number;
+  name: string;
+  maskedKey: string;
+  status: 'enabled' | 'disabled' | 'expired' | 'exhausted' | 'unknown';
+  group: string;
+  autoGroups?: string[];
+  createdAt: number;
+  expiresAt: number;
+};
+
+export type CryptoAsset = 'USDT' | 'USDC';
+export type CryptoNetwork = 'bsc' | 'ethereum' | 'base' | 'solana';
+
+export type CryptoNetworkOption = {
+  network: CryptoNetwork;
+  name: string;
+  assets: CryptoAsset[];
+  requiredConfirmations: number;
+};
+
+export type TopUpPaymentMethod = {
+  type: 'alipay' | 'wxpay' | 'crypto';
+  name: string;
+  minTopup?: number;
+  cryptoNetworks?: CryptoNetworkOption[];
+};
+
+export type TopUpOptions = {
+  enabled: boolean;
+  displayType: NewApiStatus['quotaDisplayType'];
+  minTopup: number;
+  amountOptions: number[];
+  paymentMethods: TopUpPaymentMethod[];
+};
+
+export type TopUpQuote = {
+  topupAmount: number;
+  paymentMethod: TopUpPaymentMethod['type'];
+  payableAmount: string;
+  expiresIn: number;
+  cryptoAsset?: CryptoAsset;
+  cryptoNetwork?: CryptoNetwork;
+};
+
+export type TopUpOrder = {
+  orderRef: string;
+  status: 'pending' | 'processing' | 'success' | 'failed' | 'expired';
+  topupAmount: number;
+  paymentMethod: TopUpPaymentMethod['type'];
+  payableAmount: string;
+  checkoutUrl?: string;
+  cryptoAsset?: CryptoAsset;
+  cryptoNetwork?: CryptoNetwork;
+  depositAddress?: string;
+  depositMemo?: string;
+  requiredConfirmations?: number;
+  expiresAt: number;
+};
+
+export type TopUpStatus = {
+  orderRef: string;
+  status: TopUpOrder['status'];
+  paymentMethod: TopUpPaymentMethod['type'];
+  payableAmount: string;
+  cryptoAsset?: CryptoAsset;
+  cryptoNetwork?: CryptoNetwork;
+  requiredConfirmations?: number;
+  createdAt: number;
+  completedAt?: number;
+  expiresAt: number;
+};
+
 export interface BotRepository {
   init(): Promise<void>;
   close(): Promise<void>;
   claimUpdate(updateId: number): Promise<boolean>;
-  upsertTelegramUser(user: TelegramUser): Promise<void>;
+  upsertTelegramUser(user: TelegramUser): Promise<TelegramUser>;
+  setTelegramUserLocale(telegramUserId: string, locale: TelegramUser['locale']): Promise<void>;
   getBinding(telegramUserId: string): Promise<AccountBinding | null>;
   saveBinding(binding: AccountBinding): Promise<void>;
   revokeBinding(telegramUserId: string): Promise<void>;

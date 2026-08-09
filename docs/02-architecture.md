@@ -23,7 +23,7 @@ flowchart LR
     U[Telegram 用户] --> TG[Telegram Bot API]
     TG --> B[SuperToken Bot]
     B --> D[Bot SQLite 或 PostgreSQL]
-    B -->|HMAC 只读请求| N[new-api Telegram Bridge]
+    B -->|HMAC scoped Bridge v1| N[new-api Telegram Bridge]
     N --> A[new-api 自有数据库]
     B --> O[运营 Telegram 群]
 ```
@@ -32,14 +32,14 @@ flowchart LR
 | --- | --- | --- |
 | 账户、额度、用量、订阅 | `new-api` | 实时读取最小摘要，不缓存或累计 |
 | 请求明细、消费日志 | `new-api` | 不读取为持久化数据，不保存 |
-| 订单、支付、充值、退款 | `new-api` | 不展示、不处理、不保存 |
+| 订单、支付、充值、退款 | `new-api` | `admin` 模式仅跳转网页；仅已验收的 Bridge 才能发起 scoped 订单并展示状态/checkout，不保存 |
 | API Key、PAT、密码、兑换码 | `new-api` | 不接收、不保存、不转发 |
 | Telegram 身份与绑定 | Bot | 保存数字 ID 与一对一绑定映射 |
 | 通知偏好、去重键、Update 去重 | Bot | 保存运营所需最小状态 |
 | 客服 | Telegram 会话/运营群 | Bot 仅保存回复路由映射，不保存正文副本 |
 | Bot 审计 | Bot | 仅记录动作、目标和白名单运营计数 |
 
-Node 只通过 HTTP 调用 `new-api`。Bridge 模式由 `new-api` 根据 Telegram ID 解析用户，Node 不传入可替换的用户 ID，也不直连 `new-api` 数据库。
+Node 只通过 HTTP 调用 `new-api`。默认 `admin` 模式以网页 Telegram 绑定加手动用户 ID 复核后读取账户，不调用用户 Key 或支付路由；该模式的 Admin PAT 是高权限部署密钥。Bridge 模式由 `new-api` 根据 Telegram ID 解析用户，Node 不传入可替换的用户 ID，也不直连 `new-api` 数据库。查询、Key 状态切换、受限 Key 创建和订单意图是唯一允许的 scoped 动作；完整 Key、余额账本和支付回调始终留在 `new-api`。
 
 ## 3. 绑定与查询流程
 
@@ -81,7 +81,7 @@ sequenceDiagram
 
 ## 5. 安全边界
 
-- Bridge 只暴露账户摘要、用量和订阅三个只读接口。
+- Bridge v1 已额外提供受 HMAC 保护的账户、模型、API Key 和充值接口。Key 创建使用服务端选定的模型分组与幂等键，响应只能包含掩码 Key；充值使用服务端金额计算、幂等键和跨用户隔离。外部服务商验收范围见 `docs/05-telegram-epay-topup-plan.md`。
 - HMAC 覆盖 method、path、body hash、timestamp 与 nonce；`new-api` 持久化 nonce 防重放。
 - 账号查询限定 Telegram 私聊，绑定以 Telegram 数字 ID 复核。
 - 管理员功能使用数字 ID 白名单，不依赖可变更的 `@username`。
@@ -104,6 +104,10 @@ TELEGRAM_BOT_TOKEN
 TELEGRAM_WEBHOOK_SECRET
 NEW_API_INTEGRATION_MODE
 NEW_API_BASE_URL
+NEW_API_PORTAL_URL
+NEW_API_PRICING_URL
+NEW_API_DOCS_URL
+NEW_API_TOPUP_URL
 NEW_API_INTEGRATION_SECRET
 DATABASE_URL
 BOT_ADMIN_TELEGRAM_IDS

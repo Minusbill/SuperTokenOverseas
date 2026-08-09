@@ -2,6 +2,7 @@ import type { Bot } from 'grammy';
 import type { Logger } from 'pino';
 import type { Config } from './config.js';
 import { formatQuota, formatTimestamp } from './format.js';
+import type { Locale } from './i18n.js';
 import { NewApiError, type NewApiClient } from './new-api.js';
 import { sendMessageWithRetry } from './telegram.js';
 import type { BotRepository, NewApiAccount, NewApiStatus, Subscription } from './types.js';
@@ -25,7 +26,7 @@ export async function runNotificationCycle(deps: NotificationWorkerDependencies)
     if (preference.paused) continue;
     try {
       const account = await resolveAccount(deps, binding.newApiUserId, user.telegramUserId);
-      await checkLowQuota(deps, user.chatId, user.telegramUserId, account, status, preference.lowQuotaThreshold);
+      await checkLowQuota(deps, user.chatId, user.telegramUserId, account, status, preference.lowQuotaThreshold, user.locale);
       const subscriptions = await deps.newApi.getSubscriptions(account);
       await checkSubscriptionExpiry(
         deps,
@@ -35,6 +36,7 @@ export async function runNotificationCycle(deps: NotificationWorkerDependencies)
         subscriptions,
         preference.subscriptionNoticeDays,
         now,
+        user.locale,
       );
     } catch (error) {
       deps.logger.warn({ err: error, newApiUserId: binding.newApiUserId }, 'notification check failed');
@@ -79,6 +81,7 @@ async function checkLowQuota(
   account: NewApiAccount,
   status: NewApiStatus,
   preferenceThreshold?: number,
+  locale: Locale = 'zh',
 ): Promise<void> {
   const threshold = preferenceThreshold ?? deps.config.notificationDefaultLowQuotaThreshold;
   if (threshold === undefined) return;
@@ -94,7 +97,9 @@ async function checkLowQuota(
     await sendMessageWithRetry(
       deps.bot.api,
       chatId,
-      `余额提醒\n剩余额度：${formatQuota(remaining, status)}\n当前阈值：${formatQuota(threshold, status)}`,
+      locale === 'en'
+        ? `Balance alert\nRemaining quota: ${formatQuota(remaining, status)}\nThreshold: ${formatQuota(threshold, status)}`
+        : `余额提醒\n剩余额度：${formatQuota(remaining, status)}\n当前阈值：${formatQuota(threshold, status)}`,
     );
   } catch (error) {
     await deps.repository.clearNotificationEvent(eventKey);
@@ -110,6 +115,7 @@ async function checkSubscriptionExpiry(
   subscriptions: Subscription[],
   noticeDays: number,
   now: number,
+  locale: Locale = 'zh',
 ): Promise<void> {
   if (noticeDays <= 0) return;
   const deadline = now + noticeDays * 24 * 60 * 60;
@@ -124,7 +130,9 @@ async function checkSubscriptionExpiry(
       await sendMessageWithRetry(
         deps.bot.api,
         chatId,
-        `订阅提醒\n订阅 #${subscription.id} 将于 ${formatTimestamp(subscription.endTime)} 到期。`,
+        locale === 'en'
+          ? `Subscription alert\nSubscription #${subscription.id} ends on ${formatTimestamp(subscription.endTime, locale)}.`
+          : `订阅提醒\n订阅 #${subscription.id} 将于 ${formatTimestamp(subscription.endTime, locale)} 到期。`,
       );
     } catch (error) {
       await deps.repository.clearNotificationEvent(eventKey);

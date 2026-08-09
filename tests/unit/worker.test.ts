@@ -50,4 +50,28 @@ describe('notification worker', () => {
     await runNotificationCycle({ config: testConfig(), repository, newApi: newApi as never, bot, logger: pino({ enabled: false }) });
     expect(messages).toHaveLength(3);
   });
+
+  it('uses the recipient locale for notification text', async () => {
+    const repository = new MemoryRepository();
+    await repository.upsertTelegramUser({ telegramUserId: '2002', chatId: '2002', locale: 'en' });
+    await repository.saveBinding({
+      telegramUserId: '2002', newApiUserId: 43, usernameSnapshot: 'bob', status: 'active',
+      verifiedAt: new Date(), lastVerifiedAt: new Date(),
+    });
+    const messages: string[] = [];
+    const newApi = {
+      getStatus: async () => status,
+      resolveAccountByTelegramId: async () => ({
+        id: 43, username: 'bob', telegramId: '2002', status: 1, quota: 100, usedQuota: 0,
+      }),
+      getSubscriptions: async () => [],
+    };
+    const bot = { api: { sendMessage: async (_chatId: string, message: string) => {
+      messages.push(message);
+      return { message_id: messages.length };
+    } } } as unknown as Bot;
+
+    await runNotificationCycle({ config: testConfig(), repository, newApi: newApi as never, bot, logger: pino({ enabled: false }) });
+    expect(messages[0]).toContain('Balance alert');
+  });
 });

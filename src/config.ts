@@ -4,6 +4,7 @@ import { z } from 'zod';
 const optionalEnvString = z.preprocess((value) => value === '' ? undefined : value, z.string().optional());
 const optionalSecret = z.preprocess((value) => value === '' ? undefined : value, z.string().min(16).optional());
 const optionalNumber = z.preprocess((value) => value === '' ? undefined : value, z.coerce.number().int().nonnegative().optional());
+const optionalUrl = z.preprocess((value) => value === '' ? undefined : value, z.string().url().optional());
 const optionalDatabaseUrl = z.preprocess(
   (value) => value === '' ? undefined : value,
   z.string().url().refine(
@@ -21,6 +22,10 @@ const envSchema = z.object({
   TELEGRAM_WEBHOOK_SECRET: z.string().min(16).default('development-webhook-secret'),
   NEW_API_INTEGRATION_MODE: z.enum(['admin', 'bridge']).default('admin'),
   NEW_API_BASE_URL: z.string().url(),
+  NEW_API_PORTAL_URL: optionalUrl,
+  NEW_API_PRICING_URL: optionalUrl,
+  NEW_API_DOCS_URL: optionalUrl,
+  NEW_API_TOPUP_URL: optionalUrl,
   NEW_API_ADMIN_PAT: optionalEnvString.pipe(z.string().min(1).optional()),
   NEW_API_INTEGRATION_SECRET: optionalSecret,
   NEW_API_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(500).max(30000).default(4000),
@@ -42,6 +47,10 @@ export type Config = {
   telegramWebhookSecret: string;
   newApiIntegrationMode: 'admin' | 'bridge';
   newApiBaseUrl: string;
+  newApiPortalUrl: string;
+  newApiPricingUrl: string;
+  newApiDocsUrl?: string;
+  newApiTopupUrl: string;
   newApiAdminPat?: string;
   newApiIntegrationSecret?: string;
   newApiRequestTimeoutMs: number;
@@ -74,6 +83,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
       .map((value) => value.trim())
       .filter(Boolean),
   );
+  const newApiBaseUrl = parsed.NEW_API_BASE_URL.replace(/\/$/, '');
+  const newApiPortalUrl = (parsed.NEW_API_PORTAL_URL ?? newApiBaseUrl).replace(/\/$/, '');
 
   return {
     nodeEnv: parsed.NODE_ENV,
@@ -83,7 +94,11 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     telegramBotToken: parsed.TELEGRAM_BOT_TOKEN,
     telegramWebhookSecret: parsed.TELEGRAM_WEBHOOK_SECRET,
     newApiIntegrationMode: parsed.NEW_API_INTEGRATION_MODE,
-    newApiBaseUrl: parsed.NEW_API_BASE_URL.replace(/\/$/, ''),
+    newApiBaseUrl,
+    newApiPortalUrl,
+    newApiPricingUrl: (parsed.NEW_API_PRICING_URL ?? `${newApiPortalUrl}/pricing`).replace(/\/$/, ''),
+    ...(parsed.NEW_API_DOCS_URL ? { newApiDocsUrl: parsed.NEW_API_DOCS_URL.replace(/\/$/, '') } : {}),
+    newApiTopupUrl: (parsed.NEW_API_TOPUP_URL ?? newApiPortalUrl).replace(/\/$/, ''),
     ...(parsed.NEW_API_ADMIN_PAT ? { newApiAdminPat: parsed.NEW_API_ADMIN_PAT } : {}),
     ...(parsed.NEW_API_INTEGRATION_SECRET
       ? { newApiIntegrationSecret: parsed.NEW_API_INTEGRATION_SECRET }

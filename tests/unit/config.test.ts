@@ -21,7 +21,23 @@ describe('loadConfig', () => {
     }));
 
     expect(config.newApiBaseUrl).toBe('https://new-api.example.test');
+    expect(config.newApiPortalUrl).toBe('https://new-api.example.test');
+    expect(config.newApiPricingUrl).toBe('https://new-api.example.test/pricing');
     expect([...config.botAdminTelegramIds]).toEqual(['123', '456']);
+  });
+
+  it('uses explicitly configured user-facing portal URLs', () => {
+    const config = loadConfig(baseEnv({
+      NEW_API_PORTAL_URL: 'https://portal.example.test/',
+      NEW_API_PRICING_URL: 'https://portal.example.test/pricing/',
+      NEW_API_DOCS_URL: 'https://docs.example.test/',
+      NEW_API_TOPUP_URL: 'https://portal.example.test/billing/',
+    }));
+
+    expect(config.newApiPortalUrl).toBe('https://portal.example.test');
+    expect(config.newApiPricingUrl).toBe('https://portal.example.test/pricing');
+    expect(config.newApiDocsUrl).toBe('https://docs.example.test');
+    expect(config.newApiTopupUrl).toBe('https://portal.example.test/billing');
   });
 
   it('requires the bridge secret when bridge mode is enabled', () => {

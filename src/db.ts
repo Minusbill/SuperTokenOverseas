@@ -45,17 +45,25 @@ export class PostgresRepository implements BotRepository {
     return result.rowCount === 1;
   }
 
-  public async upsertTelegramUser(user: TelegramUser): Promise<void> {
-    await this.pool.query(
+  public async upsertTelegramUser(user: TelegramUser): Promise<TelegramUser> {
+    const result = await this.pool.query(
       `INSERT INTO telegram_users (telegram_user_id, chat_id, username, display_name, locale)
        VALUES ($1, $2, $3, $4, $5)
        ON CONFLICT (telegram_user_id) DO UPDATE SET
          chat_id = EXCLUDED.chat_id,
          username = EXCLUDED.username,
          display_name = EXCLUDED.display_name,
-         locale = EXCLUDED.locale,
-         updated_at = NOW()`,
+         updated_at = NOW()
+       RETURNING telegram_user_id, chat_id, username, display_name, locale`,
       [user.telegramUserId, user.chatId, user.username ?? null, user.displayName ?? null, user.locale],
+    );
+    return mapTelegramUser(result.rows[0] as Record<string, unknown>);
+  }
+
+  public async setTelegramUserLocale(telegramUserId: string, locale: TelegramUser['locale']): Promise<void> {
+    await this.pool.query(
+      'UPDATE telegram_users SET locale = $1, updated_at = NOW() WHERE telegram_user_id = $2',
+      [locale, telegramUserId],
     );
   }
 
@@ -292,7 +300,7 @@ export class SqliteRepository implements BotRepository {
     return Number(result.changes) === 1;
   }
 
-  public async upsertTelegramUser(user: TelegramUser): Promise<void> {
+  public async upsertTelegramUser(user: TelegramUser): Promise<TelegramUser> {
     this.db.prepare(
       `INSERT INTO telegram_users (telegram_user_id, chat_id, username, display_name, locale, updated_at)
        VALUES (?, ?, ?, ?, ?, ?)
@@ -300,7 +308,6 @@ export class SqliteRepository implements BotRepository {
          chat_id = excluded.chat_id,
          username = excluded.username,
          display_name = excluded.display_name,
-         locale = excluded.locale,
          updated_at = excluded.updated_at`,
     ).run(
       user.telegramUserId,
@@ -310,6 +317,18 @@ export class SqliteRepository implements BotRepository {
       user.locale,
       new Date().toISOString(),
     );
+    const row = this.db.prepare(
+      `SELECT telegram_user_id, chat_id, username, display_name, locale
+       FROM telegram_users WHERE telegram_user_id = ?`,
+    ).get(user.telegramUserId) as SqliteRow | undefined;
+    if (!row) throw new Error('SQLite Telegram user was not persisted');
+    return mapTelegramUser(row);
+  }
+
+  public async setTelegramUserLocale(telegramUserId: string, locale: TelegramUser['locale']): Promise<void> {
+    this.db.prepare(
+      'UPDATE telegram_users SET locale = ?, updated_at = ? WHERE telegram_user_id = ?',
+    ).run(locale, new Date().toISOString(), telegramUserId);
   }
 
   public async getBinding(telegramUserId: string): Promise<AccountBinding | null> {
@@ -534,8 +553,16 @@ export class MemoryRepository implements BotRepository {
     return true;
   }
 
-  public async upsertTelegramUser(user: TelegramUser): Promise<void> {
-    this.users.set(user.telegramUserId, user);
+  public async upsertTelegramUser(user: TelegramUser): Promise<TelegramUser> {
+    const existing = this.users.get(user.telegramUserId);
+    const saved = existing ? { ...user, locale: existing.locale } : user;
+    this.users.set(user.telegramUserId, saved);
+    return saved;
+  }
+
+  public async setTelegramUserLocale(telegramUserId: string, locale: TelegramUser['locale']): Promise<void> {
+    const existing = this.users.get(telegramUserId);
+    if (existing) this.users.set(telegramUserId, { ...existing, locale });
   }
 
   public async getBinding(telegramUserId: string): Promise<AccountBinding | null> {
@@ -655,6 +682,18 @@ function mapBinding(row: Record<string, unknown>): AccountBinding {
     status: row.status === 'revoked' ? 'revoked' : 'active',
     verifiedAt: parseDatabaseDate(row.verified_at),
     lastVerifiedAt: parseDatabaseDate(row.last_verified_at),
+  };
+}
+
+function mapTelegramUser(row: Record<string, unknown>): TelegramUser {
+  const username = row.username === null || row.username === undefined ? undefined : String(row.username);
+  const displayName = row.display_name === null || row.display_name === undefined ? undefined : String(row.display_name);
+  return {
+    telegramUserId: String(row.telegram_user_id),
+    chatId: String(row.chat_id),
+    ...(username ? { username } : {}),
+    ...(displayName ? { displayName } : {}),
+    locale: row.locale === 'en' ? 'en' : 'zh',
   };
 }
 

@@ -2,14 +2,14 @@
 
 ## 1. 核对基线
 
-本设计核对的是你们本地 fork `/Users/bill/mygit/new-api`，当前 commit：
+本设计区分上游 `new-api` 与你们的 Bridge fork。上游公开 `main` 在 2026-08-09 核对到的 commit 是：
 
 ```text
-0ab02020603d22e5613bc4cf46bfab06f8567769
-2026-08-01T23:19:01+08:00
+823e26304a396854ace30b52b98ec497c2dd9c36
+2026-08-08T06:31:29Z
 ```
 
-该仓库工作树干净，远程是 `git@github.com:Minusbill/new-api.git`。它与官方主线同源，但比 2026-08-08 主线落后约 10 个提交；上线前应固定实际部署 commit，并在 staging 做契约测试。
+你们的 fork 位于 `/Users/bill/mygit/new-api`，Bridge 基础提交是 `54a411e0e4eaa9ad50bd48cb76676b9aab18c9cc`。Bridge 及其后续工作树改动不是官方 `new-api` API；上线前必须固定实际部署 commit，并在 staging 做契约测试。
 
 ## 2. 已确认能力
 
@@ -43,7 +43,7 @@
 
 - 额度扣减、兑换和订阅结算均位于 model/service 层，Bridge 应调用这些业务函数，不能通过 Node 直写表或拼装后台 HTTP 请求绕过事务。
 - `service/authz` 已对部分管理员资源做细粒度权限控制，但用户、日志等路由仍有按 AdminAuth 直接放行的路径，不能假设普通 Admin PAT 已经是“只读 PAT”。
-- `new-api` 最新主线增加了用户级关键接口限流和兑换码额度精度修复。当前 Bot 不包含写操作，这些变更由 `new-api` 自身的网页流程负责。
+- `new-api` 最新主线增加了用户级关键接口限流和兑换码额度精度修复。Bot 的 scoped 写操作必须继续调用 `new-api` 的 model/service 领域逻辑，不能绕开这些保护。
 
 ### 不应照搬的地方
 
@@ -62,17 +62,28 @@
 - 用户列表 API 会省略密码和 access token，但管理员凭据仍然具有较大数据读取范围。
 - `new-api` 采用 AGPL-3.0 许可证。
 
-## 3.1 已实现的 Telegram Bridge
+## 3.1 Telegram Bridge v1 Contract
 
-本地 fork 当前已增加以下只读路由，代码位于 `middleware/telegram-integration.go`、`controller/telegram_integration.go` 和 `service/telegram_integration.go`：
+这是 SuperToken 定义的可移植 Contract，不是官方 `new-api` 的公共 API。任何其他 `new-api` fork 或适配器只要实现本节的安全与 DTO 合同，Node Bot 就可以接入；未经实现的官方实例不能直接接入。
 
 ```text
-POST /api/integrations/telegram/account/summary
-POST /api/integrations/telegram/account/usage
-POST /api/integrations/telegram/account/subscriptions
+POST /api/integrations/telegram/v1/account/summary
+POST /api/integrations/telegram/v1/account/usage
+POST /api/integrations/telegram/v1/account/subscriptions
+POST /api/integrations/telegram/v1/models
+POST /api/integrations/telegram/v1/api-access
+POST /api/integrations/telegram/v1/keys
+POST /api/integrations/telegram/v1/keys/create
+POST /api/integrations/telegram/v1/keys/status
+POST /api/integrations/telegram/v1/keys/delete
+POST /api/integrations/telegram/v1/topup/options
+POST /api/integrations/telegram/v1/topup/quote
+POST /api/integrations/telegram/v1/topup/orders
+POST /api/integrations/telegram/v1/topup/status
+GET  /api/integrations/telegram/v1/checkout/:signed_token
 ```
 
-所有路由都使用 `TelegramIntegrationAuth` 中间件。Node 发送的请求体只包含 Telegram 数字 ID（以及用量查询的时间范围），服务端通过 `FillUserByTelegramId` 解析目标用户，不接受 Node 传入的可替换 `new_api_user_id`。
+所有 POST 路由都使用 `TelegramIntegrationAuth`。Node 请求只包含 Telegram 数字 ID、允许列表参数和必要的幂等键；服务端通过自身的已验证绑定解析目标用户，不接受 Node 传入 `new_api_user_id`、用户 PAT、密码或模型分组字符串。
 
 请求签名使用 `TELEGRAM_INTEGRATION_SECRET`，Node 侧配置名为 `NEW_API_INTEGRATION_SECRET`。签名原文为：
 
@@ -82,15 +93,15 @@ METHOD + "\\n" + PATH + "\\n" + SHA256(raw_body) + "\\n" + TIMESTAMP + "\\n" + N
 
 签名放在 `X-Integration-Signature`（十六进制 HMAC-SHA256）中，同时发送 `X-Integration-Timestamp` 和 `X-Integration-Nonce`。服务端接受前后 300 秒内的时间戳，并把 nonce 写入 `auth_flows` 做持久化重放保护。共享密钥必须只通过 Secret Manager 或部署环境注入，不能提交到 Git。
 
-成功响应沿用 `{"success":true,"message":"","data":...}`；业务失败可能是 HTTP 200 且 `success:false`，Node 客户端会先检查 envelope 再校验 DTO。账户摘要和用量返回最小字段；订阅目前返回 `SubscriptionSummary` 包装对象，Node 会解包 `subscription` 字段。
+成功响应沿用 `{"success":true,"message":"","data":...}`；业务失败可能是 HTTP 200 且 `success:false`，Node 客户端会先检查 envelope 再校验 DTO。账户、用量、订阅和模型只返回展示字段。Key Contract 只返回 `masked_key`，Node 强制拒绝不含掩码的响应；完整 Key 仅由已登录的网页 `/keys` 页面展示。Key 创建使用服务端 profile ordinal 和一次确认 ID，重复确认必须返回同一条 Key 元数据。订单、价格计算、支付回调和入账仍由 `new-api` 作为唯一权威处理。
 
-上线前必须在 staging 使用实际部署 commit 做契约测试，并确认反向代理不会改写请求路径或请求体。Bridge 仍建议限制在内网或 mTLS 网络；HMAC 不是替代网络隔离的理由。
+上游官方实例目前没有这组 Bridge 路由。适配其他实例时不得用 Admin PAT 冒充用户会话，也不得让 Bot 直连数据库；应实现同一 Contract，并在 staging 使用实际部署 commit 做契约测试。反向代理不得改写请求路径或请求体，Bridge 应限制在内网或 mTLS 网络；HMAC 不是替代网络隔离的理由。
 
 ### 合理推测
 
 - 同一个 Telegram Bot 可以同时用于 `new-api` 的 Telegram 登录组件和本 Node Bot，因为登录流程只使用 Bot Token 验签；但这会让同一密钥存在于两个服务中，需要统一轮换。
-- 既然这是你们自己的 fork，新增只读 Bridge 比让 Node 长期持有 Admin PAT 更合理；UID 手工绑定只保留为临时联调路径。
-- 账户余额和订阅只读查询足以验证首版用户价值；Bot 不托管用户 PAT，也不规划交易或支付写操作。
+- 既然这是你们自己的 fork，新增 scoped Bridge 比让 Node 长期持有 Admin PAT 更合理；UID 手工绑定只保留为临时联调路径。
+- Bot 不托管用户 PAT；首版允许的写操作仅限 Bridge 内的 Key 创建/启停/删除和 Epay 订单意图，不能扩展为余额调整、退款、补单或链上入账。
 
 ### 暂时无法验证
 
@@ -103,7 +114,7 @@ METHOD + "\\n" + PATH + "\\n" + SHA256(raw_body) + "\\n" + TIMESTAMP + "\\n" + N
 
 Telegram Update 能证明消息来自某个 Telegram 账号，但它不能自动证明 Bot 有权获得该账号在 `new-api` 中的面板会话。`new-api` 的 Telegram 登录接口为浏览器创建登录会话，不会向外部 Bot 签发 scoped token。
 
-所以以下推导是错误的：
+所以以下推导仍然是错误的：
 
 ```text
 Telegram 消息里有 user.id
@@ -111,7 +122,7 @@ Telegram 消息里有 user.id
 => Node Bot 可以调用所有该用户的 self API
 ```
 
-前两项可以建立身份映射，但第三项缺少授权凭据。MVP 只能让受控集成客户端读取目标用户的有限资料；交易、支付和令牌写操作始终留在 `new-api` 网页流程。
+前两项可以建立身份映射，但第三项缺少授权凭据。受控 Bridge 可以在服务端再次解析绑定、鉴权、审计与幂等的前提下执行有限 Key 操作和 Epay 订单意图；完整密钥、支付回调、入账与账本写入始终留在 `new-api`。
 
 ## 6. 兼容性要求
 

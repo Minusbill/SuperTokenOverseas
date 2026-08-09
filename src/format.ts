@@ -1,4 +1,5 @@
 import type { NewApiStatus, NotificationPreference, RepositoryStats, Subscription, UsageStat } from './types.js';
+import type { Locale } from './i18n.js';
 
 export function formatQuota(quota: number, status: NewApiStatus): string {
   if (!Number.isFinite(quota)) return '-';
@@ -14,51 +15,63 @@ export function formatQuota(quota: number, status: NewApiStatus): string {
     amount = usd * (status.customCurrencyExchangeRate ?? 1);
     symbol = status.customCurrencySymbol ?? '';
   }
-  return `${symbol}${amount.toFixed(Math.abs(amount) < 1 ? 4 : 2)}`;
+  const fractionDigits = amount !== 0 && Math.abs(amount) < 1 ? 4 : 2;
+  return `${symbol}${amount.toFixed(fractionDigits)}`;
 }
 
-export function formatTimestamp(timestamp?: number): string {
+export function formatTimestamp(timestamp?: number, locale: Locale = 'zh'): string {
   if (!timestamp || timestamp <= 0) return '-';
-  return new Intl.DateTimeFormat('zh-CN', {
+  return new Intl.DateTimeFormat(locale === 'en' ? 'en-US' : 'zh-CN', {
     dateStyle: 'medium',
     timeStyle: 'short',
     timeZone: 'Asia/Shanghai',
   }).format(new Date(timestamp * 1000));
 }
 
-export function formatUsage(usage: UsageStat, status: NewApiStatus): string {
-  const lines = [`消耗：${formatQuota(usage.quota, status)}`];
-  if (usage.rpm !== undefined) lines.push(`请求速率：${usage.rpm}`);
-  if (usage.tpm !== undefined) lines.push(`Token 速率：${usage.tpm}`);
+export function formatUsage(usage: UsageStat, status: NewApiStatus, locale: Locale = 'zh'): string {
+  const lines = [locale === 'en' ? `Used: ${formatQuota(usage.quota, status)}` : `消耗：${formatQuota(usage.quota, status)}`];
+  if (usage.rpm !== undefined) lines.push(locale === 'en' ? `Requests/min: ${usage.rpm}` : `请求速率：${usage.rpm}`);
+  if (usage.tpm !== undefined) lines.push(locale === 'en' ? `Tokens/min: ${usage.tpm}` : `Token 速率：${usage.tpm}`);
   return lines.join('\n');
 }
 
-export function formatSubscriptions(subscriptions: Subscription[]): string {
-  if (subscriptions.length === 0) return '当前没有订阅记录。';
+export function formatSubscriptions(subscriptions: Subscription[], status?: NewApiStatus, locale: Locale = 'zh'): string {
+  if (subscriptions.length === 0) return locale === 'en' ? 'No subscription records.' : '当前没有订阅记录。';
   return subscriptions
     .slice(0, 5)
     .map((subscription, index) => {
-      const name = subscription.planName ?? `订阅 ${index + 1}`;
-      const status = subscription.status ?? 'unknown';
-      const end = formatTimestamp(subscription.endTime);
+      const name = subscription.planName ?? (locale === 'en' ? `Subscription ${index + 1}` : `订阅 ${index + 1}`);
+      const subscriptionStatus = subscription.status ?? 'unknown';
+      const end = formatTimestamp(subscription.endTime, locale);
       const remaining = subscription.remainingAmount !== undefined
-        ? `\n剩余额度：${subscription.remainingAmount.toLocaleString()}`
+        ? locale === 'en'
+          ? `\nRemaining: ${status ? formatQuota(subscription.remainingAmount, status) : subscription.remainingAmount.toLocaleString()}`
+          : `\n剩余额度：${status ? formatQuota(subscription.remainingAmount, status) : subscription.remainingAmount.toLocaleString()}`
         : '';
-      return `${name}\n状态：${status}\n到期：${end}${remaining}`;
+      return locale === 'en'
+        ? `${name}\nStatus: ${subscriptionStatus}\nEnds: ${end}${remaining}`
+        : `${name}\n状态：${subscriptionStatus}\n到期：${end}${remaining}`;
     })
     .join('\n\n');
 }
 
-export function formatNotice(notice: string): string {
+export function formatNotice(notice: string, locale: Locale = 'zh'): string {
   const normalized = notice.trim();
-  if (!normalized) return '当前没有公告。';
+  if (!normalized) return locale === 'en' ? 'No announcements at the moment.' : '当前没有公告。';
   return normalized.length > 3800 ? `${normalized.slice(0, 3797)}...` : normalized;
 }
 
-export function formatNotificationPreference(preference: NotificationPreference): string {
+export function formatNotificationPreference(preference: NotificationPreference, locale: Locale = 'zh'): string {
   const threshold = preference.lowQuotaThreshold === undefined
-    ? '未设置'
+    ? locale === 'en' ? 'Not set' : '未设置'
     : preference.lowQuotaThreshold.toLocaleString();
+  if (locale === 'en') {
+    return [
+      `Low balance threshold: ${threshold}`,
+      `Subscription reminder: ${preference.subscriptionNoticeDays} day(s) before expiry`,
+      `Notifications: ${preference.paused ? 'Paused' : 'Enabled'}`,
+    ].join('\n');
+  }
   return [
     `低余额阈值：${threshold}`,
     `订阅到期提醒：提前 ${preference.subscriptionNoticeDays} 天`,
@@ -66,7 +79,15 @@ export function formatNotificationPreference(preference: NotificationPreference)
   ].join('\n');
 }
 
-export function formatRepositoryStats(stats: RepositoryStats): string {
+export function formatRepositoryStats(stats: RepositoryStats, locale: Locale = 'zh'): string {
+  if (locale === 'en') {
+    return [
+      'Bot status',
+      `Active Telegram users: ${stats.telegramUsers}`,
+      `Active account links: ${stats.activeBindings}`,
+      `Open support tickets: ${stats.openTickets}`,
+    ].join('\n');
+  }
   return [
     '机器人运行摘要',
     `活跃 Telegram 用户：${stats.telegramUsers}`,
