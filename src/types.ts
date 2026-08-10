@@ -96,7 +96,27 @@ export type Subscription = {
 export type AvailableModel = {
   id: string;
   endpointTypes: string[];
+  /**
+   * Anonymous catalogue pricing only. It is deliberately absent from the
+   * Telegram Bridge response because that endpoint does not provide a
+   * user-specific price quote.
+   */
+  cataloguePrice?: CataloguePrice;
 };
+
+export type CataloguePrice =
+  | {
+    kind: 'token';
+    inputUsdPerMillion: number;
+    outputUsdPerMillion: number;
+  }
+  | {
+    kind: 'request';
+    usdPerRequest: number;
+  }
+  | {
+    kind: 'dynamic';
+  };
 
 export type AvailableModelPage = {
   models: AvailableModel[];
@@ -190,10 +210,63 @@ export type TopUpStatus = {
   expiresAt: number;
 };
 
+export type QueuedTelegramUpdate = {
+  updateId: number;
+  payload: string;
+  attempts: number;
+};
+
+export type BroadcastStatus = 'draft' | 'queued' | 'running' | 'paused' | 'completed' | 'cancelled';
+
+export type Broadcast = {
+  id: string;
+  adminTelegramUserId: string;
+  message: string;
+  status: BroadcastStatus;
+  targetCount: number;
+  delivered: number;
+  failed: number;
+  createdAt: Date;
+  updatedAt: Date;
+  completedAt?: Date;
+};
+
+export type BroadcastRecipient = {
+  telegramUserId: string;
+  chatId: string;
+};
+
+export type QueuedBroadcastDelivery = {
+  broadcastId: string;
+  telegramUserId: string;
+  chatId: string;
+  message: string;
+  attempts: number;
+};
+
 export interface BotRepository {
   init(): Promise<void>;
   close(): Promise<void>;
   claimUpdate(updateId: number): Promise<boolean>;
+  releaseUpdate(updateId: number): Promise<void>;
+  enqueueTelegramUpdate(updateId: number, payload: string): Promise<boolean>;
+  claimQueuedTelegramUpdate(): Promise<QueuedTelegramUpdate | null>;
+  completeQueuedTelegramUpdate(updateId: number): Promise<void>;
+  retryQueuedTelegramUpdate(updateId: number, retryAt: Date): Promise<'queued' | 'failed'>;
+  createBroadcastDraft(input: {
+    id: string;
+    adminTelegramUserId: string;
+    message: string;
+    recipients: BroadcastRecipient[];
+  }): Promise<Broadcast>;
+  getBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null>;
+  queueBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null>;
+  pauseBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null>;
+  resumeBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null>;
+  cancelBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null>;
+  claimBroadcastDelivery(): Promise<QueuedBroadcastDelivery | null>;
+  completeBroadcastDelivery(broadcastId: string, telegramUserId: string): Promise<void>;
+  retryBroadcastDelivery(broadcastId: string, telegramUserId: string, retryAt: Date): Promise<'queued' | 'failed' | 'cancelled'>;
   upsertTelegramUser(user: TelegramUser): Promise<TelegramUser>;
   setTelegramUserLocale(telegramUserId: string, locale: TelegramUser['locale']): Promise<void>;
   getBinding(telegramUserId: string): Promise<AccountBinding | null>;

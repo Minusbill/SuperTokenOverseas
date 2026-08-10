@@ -56,6 +56,50 @@ CREATE TABLE IF NOT EXISTS processed_updates (
   received_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS telegram_update_queue (
+  update_id BIGINT PRIMARY KEY,
+  payload TEXT,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  lease_expires_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_update_queue_available
+  ON telegram_update_queue (status, available_at, update_id);
+
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id TEXT PRIMARY KEY,
+  admin_telegram_user_id TEXT NOT NULL,
+  message TEXT NOT NULL CHECK (char_length(message) BETWEEN 1 AND 3500),
+  status TEXT NOT NULL CHECK (status IN ('draft', 'queued', 'running', 'paused', 'completed', 'cancelled')),
+  target_count INTEGER NOT NULL CHECK (target_count >= 0),
+  delivered_count INTEGER NOT NULL DEFAULT 0 CHECK (delivered_count >= 0),
+  failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS broadcast_deliveries (
+  broadcast_id TEXT NOT NULL REFERENCES broadcasts(id) ON DELETE CASCADE,
+  telegram_user_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'delivered', 'failed', 'cancelled')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  available_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  lease_expires_at TIMESTAMPTZ,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  completed_at TIMESTAMPTZ,
+  PRIMARY KEY (broadcast_id, telegram_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_deliveries_available
+  ON broadcast_deliveries (status, available_at, broadcast_id, telegram_user_id);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
   id BIGSERIAL PRIMARY KEY,
   actor_telegram_user_id TEXT,

@@ -27,7 +27,7 @@ describe('notification worker', () => {
     });
     const messages: string[] = [];
     let account: NewApiAccount = {
-      id: 42, username: 'alice', telegramId: '1001', status: 1, quota: 100, usedQuota: 0,
+      id: 42, username: 'alice', telegramId: '1001', status: 1, quota: 100, usedQuota: 50_000,
     };
     const expiry: Subscription = { id: 9, status: 'active', endTime: Math.floor(Date.now() / 1000) + 3600 };
     const newApi = {
@@ -62,7 +62,7 @@ describe('notification worker', () => {
     const newApi = {
       getStatus: async () => status,
       resolveAccountByTelegramId: async () => ({
-        id: 43, username: 'bob', telegramId: '2002', status: 1, quota: 100, usedQuota: 0,
+        id: 43, username: 'bob', telegramId: '2002', status: 1, quota: 100, usedQuota: 50_000,
       }),
       getSubscriptions: async () => [],
     };
@@ -73,5 +73,6 @@ describe('notification worker', () => {
 
     await runNotificationCycle({ config: testConfig(), repository, newApi: newApi as never, bot, logger: pino({ enabled: false }) });
     expect(messages[0]).toContain('Balance alert');
+    expect(messages[0]).toContain('Current balance: $0.0002');
   });
 });

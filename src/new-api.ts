@@ -6,6 +6,7 @@ import type {
   AvailableModelPage,
   ApiAccess,
   ApiKey,
+  CataloguePrice,
   CryptoAsset,
   CryptoNetwork,
   NewApiAccount,
@@ -76,6 +77,19 @@ const availableModelPageSchema = z.object({
 const publicPricingModelSchema = z.object({
   model_name: z.string().min(1).max(255),
   supported_endpoint_types: z.array(z.string().min(1).max(80)).max(16).optional(),
+  quota_type: z.coerce.number().int().optional(),
+  model_ratio: z.coerce.number().finite().nonnegative().optional(),
+  completion_ratio: z.coerce.number().finite().nonnegative().optional(),
+  model_price: z.coerce.number().finite().nonnegative().optional(),
+  enable_groups: z.array(z.string().min(1).max(255)).max(128).optional(),
+  billing_mode: z.string().max(80).optional(),
+  billing_expr: z.string().max(10_000).optional(),
+});
+
+const publicPricingEnvelopeSchema = z.object({
+  success: z.boolean().optional(),
+  data: z.unknown(),
+  group_ratio: z.record(z.string().min(1).max(255), z.coerce.number().finite()).optional(),
 });
 
 const apiKeyProfileSchema = z.object({
@@ -125,7 +139,9 @@ const topUpOptionsSchema = z.object({
   display_type: z.enum(['USD', 'CNY', 'TOKENS', 'CUSTOM']),
   min_topup: z.coerce.number().int().positive(),
   amount_options: z.array(z.coerce.number().int().positive()).max(20),
-  payment_methods: z.array(topUpPaymentMethodSchema).max(3),
+  // new-api serializes a nil Go slice as null when Telegram payments are
+  // disabled. Normalize that representation so the Bot can show availability.
+  payment_methods: z.array(topUpPaymentMethodSchema).max(3).nullable().transform((value) => value ?? []),
 });
 
 const topUpStatusValueSchema = z.enum(['pending', 'processing', 'success', 'failed', 'expired']);
@@ -251,6 +267,41 @@ function mapSubscription(input: z.infer<typeof subscriptionSchema>): Subscriptio
   };
 }
 
+function publicMinimumGroupRatio(
+  enabledGroups: string[] | undefined,
+  groupRatios: Record<string, number>,
+): number {
+  if (!enabledGroups || enabledGroups.length === 0) return 1;
+  let minimum = Number.POSITIVE_INFINITY;
+  for (const group of enabledGroups) {
+    const ratio = groupRatios[group];
+    if (typeof ratio === 'number' && Number.isFinite(ratio) && ratio >= 0 && ratio < minimum) minimum = ratio;
+  }
+  return minimum === Number.POSITIVE_INFINITY ? 1 : minimum;
+}
+
+function cataloguePrice(
+  model: z.infer<typeof publicPricingModelSchema>,
+  groupRatios: Record<string, number>,
+): CataloguePrice | undefined {
+  if (model.billing_mode === 'tiered_expr' && model.billing_expr?.trim()) return { kind: 'dynamic' };
+
+  const ratio = publicMinimumGroupRatio(model.enable_groups, groupRatios);
+  if (model.quota_type === 0 && model.model_ratio !== undefined && model.completion_ratio !== undefined) {
+    const inputUsdPerMillion = model.model_ratio * 2 * ratio;
+    const outputUsdPerMillion = inputUsdPerMillion * model.completion_ratio;
+    if (Number.isFinite(inputUsdPerMillion) && inputUsdPerMillion >= 0
+      && Number.isFinite(outputUsdPerMillion) && outputUsdPerMillion >= 0) {
+      return { kind: 'token', inputUsdPerMillion, outputUsdPerMillion };
+    }
+  }
+  if (model.quota_type === 1 && model.model_price !== undefined) {
+    const usdPerRequest = model.model_price * ratio;
+    if (Number.isFinite(usdPerRequest) && usdPerRequest >= 0) return { kind: 'request', usdPerRequest };
+  }
+  return undefined;
+}
+
 export class NewApiClient {
   public constructor(private readonly config: Config, private readonly logger: Logger) {}
 
@@ -341,6 +392,7 @@ export class NewApiClient {
     }
     const payload = await this.request('/api/pricing', { authenticated: false });
     const value = unwrapData(payload);
+    const envelope = publicPricingEnvelopeSchema.safeParse(payload);
     const candidates = Array.isArray(value)
       ? value
       : typeof value === 'object' && value !== null && Array.isArray((value as { models?: unknown }).models)
@@ -349,11 +401,16 @@ export class NewApiClient {
     if (!candidates) throw new NewApiError('contract', 'new-api pricing response changed');
     const parsed = z.array(publicPricingModelSchema).safeParse(candidates);
     if (!parsed.success) throw new NewApiError('contract', 'new-api pricing response changed');
+    const groupRatios = envelope.success ? envelope.data.group_ratio ?? {} : {};
     const pageSize = 12;
-    const models = parsed.data.slice(offset, offset + pageSize).map((model) => ({
-      id: model.model_name,
-      endpointTypes: model.supported_endpoint_types ?? [],
-    }));
+    const models = parsed.data.slice(offset, offset + pageSize).map((model) => {
+      const price = cataloguePrice(model, groupRatios);
+      return {
+        id: model.model_name,
+        endpointTypes: model.supported_endpoint_types ?? [],
+        ...(price ? { cataloguePrice: price } : {}),
+      };
+    });
     const nextOffset = offset + models.length;
     return {
       models,

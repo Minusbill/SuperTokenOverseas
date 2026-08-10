@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { formatQuota, formatSubscriptions } from '../../src/format.js';
+import { formatBillingPrice, formatNotificationPreference, formatQuota, formatSubscriptions, quotaFromDisplayAmount } from '../../src/format.js';
 import type { NewApiStatus } from '../../src/types.js';
 
 const status: NewApiStatus = { quotaPerUnit: 500_000, quotaDisplayType: 'USD', usdExchangeRate: 7.2 };
@@ -15,6 +15,27 @@ describe('quota formatting', () => {
 
   it('shows a zero currency balance with the standard two decimal places', () => {
     expect(formatQuota(0, status)).toBe('$0.00');
+  });
+
+  it('converts a displayed threshold back to internal quota units', () => {
+    expect(quotaFromDisplayAmount(50, status)).toBe(25_000_000);
+    expect(quotaFromDisplayAmount(72, { ...status, quotaDisplayType: 'CNY' })).toBe(5_000_000);
+    expect(quotaFromDisplayAmount(1.5, { ...status, quotaDisplayType: 'TOKENS' })).toBeUndefined();
+  });
+
+  it('formats a stored notification threshold in the account display unit', () => {
+    expect(formatNotificationPreference({
+      telegramUserId: '1001', lowQuotaThreshold: 25_000_000, subscriptionNoticeDays: 3,
+      paused: false, updatedAt: new Date(),
+    }, 'en', status)).toContain('Low balance threshold: $50.00');
+  });
+
+  it('uses a currency, rather than tokens, for model billing prices', () => {
+    expect(formatBillingPrice(1, { ...status, quotaDisplayType: 'TOKENS' })).toBe('$1');
+    expect(formatBillingPrice(0.5, { ...status, quotaDisplayType: 'CNY' })).toBe('¥3.6');
+    expect(formatBillingPrice(0.5, {
+      ...status, quotaDisplayType: 'CUSTOM', customCurrencySymbol: 'S$', customCurrencyExchangeRate: 2,
+    })).toBe('S$1');
   });
 });
 

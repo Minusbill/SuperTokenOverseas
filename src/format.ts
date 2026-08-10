@@ -19,6 +19,48 @@ export function formatQuota(quota: number, status: NewApiStatus): string {
   return `${symbol}${amount.toFixed(fractionDigits)}`;
 }
 
+export function quotaFromDisplayAmount(amount: number, status: NewApiStatus): number | undefined {
+  if (!Number.isFinite(amount) || amount < 0) return undefined;
+  if (status.quotaDisplayType === 'TOKENS') {
+    return Number.isSafeInteger(amount) ? amount : undefined;
+  }
+
+  const exchangeRate = status.quotaDisplayType === 'CNY'
+    ? status.usdExchangeRate ?? 1
+    : status.quotaDisplayType === 'CUSTOM'
+      ? status.customCurrencyExchangeRate ?? 1
+      : 1;
+  if (!Number.isFinite(exchangeRate) || exchangeRate <= 0) return undefined;
+  const quota = Math.round((amount / exchangeRate) * status.quotaPerUnit);
+  return Number.isSafeInteger(quota) && quota >= 0 ? quota : undefined;
+}
+
+/**
+ * Formats a USD billing value using the public model-pricing display currency.
+ * Unlike quota formatting, a token display configuration still uses USD here.
+ */
+export function formatBillingPrice(usd: number, status?: NewApiStatus): string {
+  if (!Number.isFinite(usd) || usd < 0) return '-';
+  if (usd === 0) return '$0';
+  if (usd < 0.00000001) return '<$0.00000001';
+
+  let amount = usd;
+  let symbol = '$';
+  if (status?.quotaDisplayType === 'CNY') {
+    const exchangeRate = status.usdExchangeRate ?? 1;
+    if (Number.isFinite(exchangeRate) && exchangeRate > 0) amount *= exchangeRate;
+    symbol = '¥';
+  } else if (status?.quotaDisplayType === 'CUSTOM') {
+    const exchangeRate = status.customCurrencyExchangeRate ?? 1;
+    if (Number.isFinite(exchangeRate) && exchangeRate > 0) amount *= exchangeRate;
+    symbol = status.customCurrencySymbol ?? '';
+  }
+
+  return `${symbol}${new Intl.NumberFormat('en-US', {
+    maximumFractionDigits: amount < 1 ? 8 : 4,
+  }).format(amount)}`;
+}
+
 export function formatTimestamp(timestamp?: number, locale: Locale = 'zh'): string {
   if (!timestamp || timestamp <= 0) return '-';
   return new Intl.DateTimeFormat(locale === 'en' ? 'en-US' : 'zh-CN', {
@@ -61,10 +103,16 @@ export function formatNotice(notice: string, locale: Locale = 'zh'): string {
   return normalized.length > 3800 ? `${normalized.slice(0, 3797)}...` : normalized;
 }
 
-export function formatNotificationPreference(preference: NotificationPreference, locale: Locale = 'zh'): string {
+export function formatNotificationPreference(
+  preference: NotificationPreference,
+  locale: Locale = 'zh',
+  status?: NewApiStatus,
+): string {
   const threshold = preference.lowQuotaThreshold === undefined
     ? locale === 'en' ? 'Not set' : '未设置'
-    : preference.lowQuotaThreshold.toLocaleString();
+    : status
+      ? formatQuota(preference.lowQuotaThreshold, status)
+      : preference.lowQuotaThreshold.toLocaleString();
   if (locale === 'en') {
     return [
       `Low balance threshold: ${threshold}`,

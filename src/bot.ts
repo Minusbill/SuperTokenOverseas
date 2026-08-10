@@ -10,16 +10,20 @@ import { localeFromTelegramLanguage, t, welcomeMessage, type Locale } from './i1
 import {
   formatNotificationPreference,
   formatNotice,
+  formatBillingPrice,
   formatQuota,
   formatRepositoryStats,
   formatSubscriptions,
   formatTimestamp,
   formatUsage,
+  quotaFromDisplayAmount,
 } from './format.js';
 import type {
   BotRepository,
   ApiAccess,
   ApiKey,
+  Broadcast,
+  CataloguePrice,
   CryptoAsset,
   CryptoNetwork,
   NewApiAccount,
@@ -52,9 +56,15 @@ function resourceMenu(locale: Locale, config: Config): InlineKeyboard {
   return keyboard;
 }
 
-const pendingBroadcasts = new Map<string, string>();
 const contextLocales = new WeakMap<Context, Locale>();
 type UsageRange = '24h' | 'today' | '7d' | '30d';
+type RateLimitScope = 'bind' | 'support' | 'admin';
+type RateLimitBucket = { count: number; resetsAt: number };
+const rateLimitRules: Record<RateLimitScope, { limit: number; windowMs: number }> = {
+  bind: { limit: 5, windowMs: 60_000 },
+  support: { limit: 3, windowMs: 60_000 },
+  admin: { limit: 10, windowMs: 60_000 },
+};
 const sensitiveSupportContent = /(?:\b(?:authorization|bearer|api[-_ ]?key|password|cvv)\b|sk-[\w-]{8,}|密码|密钥|验证码|(?:\d[ -]?){13,19})/i;
 
 function isPrivate(ctx: Context): boolean {
@@ -85,23 +95,44 @@ export type BotDependencies = {
   repository: BotRepository;
   newApi: NewApiClient;
   logger: Logger;
+  onBroadcastQueued?: () => void;
 };
 
 export function createBot(deps: BotDependencies): Bot {
   const bot = new Bot(deps.config.telegramBotToken);
+  const rateLimitBuckets = new Map<string, RateLimitBucket>();
 
   bot.use(async (ctx, next) => {
+    let claimedUpdateId: number | undefined;
     if (ctx.update.update_id !== undefined) {
       const accepted = await deps.repository.claimUpdate(ctx.update.update_id);
       if (!accepted) return;
+      claimedUpdateId = ctx.update.update_id;
     }
-    const user = telegramUserFromContext(ctx);
-    if (user) contextLocales.set(ctx, (await deps.repository.upsertTelegramUser(user)).locale);
-    await next();
+    try {
+      const user = telegramUserFromContext(ctx);
+      if (user) contextLocales.set(ctx, (await deps.repository.upsertTelegramUser(user)).locale);
+      await next();
+    } catch (error) {
+      if (claimedUpdateId !== undefined) await deps.repository.releaseUpdate(claimedUpdateId);
+      throw error;
+    }
+  });
+
+  bot.use(async (ctx, next) => {
+    const scope = rateLimitScope(ctx);
+    if (!scope || !ctx.from) return next();
+    const allowed = consumeRateLimit(rateLimitBuckets, `${scope}:${ctx.from.id}`, rateLimitRules[scope]);
+    if (allowed) return next();
+    const locale = localeFor(ctx);
+    await ctx.reply(locale === 'en'
+      ? 'Too many requests. Wait a minute and try again.'
+      : '操作过于频繁，请等待一分钟后重试。');
   });
 
   bot.catch((error) => {
     deps.logger.error({ err: error.error, updateId: error.ctx.update.update_id }, 'telegram update failed');
+    if (deps.config.botMode === 'webhook') throw error.error;
   });
 
   bot.command('start', async (ctx) => {
@@ -195,12 +226,16 @@ export function createBot(deps: BotDependencies): Bot {
       try {
         const account = await deps.newApi.resolveAccountByTelegramId(String(ctx.from.id));
         await saveBinding(ctx, deps, account);
-        return ctx.reply('账号绑定成功。', { reply_markup: menu() });
+        const locale = localeFor(ctx);
+        return ctx.reply(locale === 'en' ? 'Account linked.' : '账号绑定成功。', { reply_markup: menu(locale) });
       } catch (error) {
-        return ctx.reply(bindFailureMessage(error, true));
+        return ctx.reply(bindFailureMessage(error, true, localeFor(ctx)));
       }
     }
-    return ctx.reply('请先在 new-api 网页完成 Telegram 绑定，然后发送：/bind 用户ID');
+    const locale = localeFor(ctx);
+    return ctx.reply(locale === 'en'
+      ? 'Link Telegram in the new-api web portal first, then send: /bind <user ID>'
+      : '请先在 new-api 网页完成 Telegram 绑定，然后发送：/bind 用户ID');
   });
   bot.callbackQuery('account', async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -264,7 +299,8 @@ export function createBot(deps: BotDependencies): Bot {
   });
   bot.callbackQuery('topup:custom', async (ctx) => {
     await ctx.answerCallbackQuery();
-    await ctx.reply('请输入自定义充值金额，例如：/topup 300。', { reply_markup: menu(localeFor(ctx)) });
+    const locale = localeFor(ctx);
+    await ctx.reply(locale === 'en' ? 'Enter a custom amount, for example: /topup 300.' : '请输入自定义充值金额，例如：/topup 300。', { reply_markup: menu(locale) });
   });
   bot.callbackQuery('language', async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -286,20 +322,29 @@ export function createBot(deps: BotDependencies): Bot {
     await ctx.answerCallbackQuery();
     const amount = parseTopUpAmount(ctx.match?.[1]);
     const paymentMethod = ctx.match?.[2] as TopUpPaymentMethod['type'] | undefined;
-    if (!amount || !paymentMethod) return void (await ctx.reply('充值请求无效，请重新选择金额。', { reply_markup: menu() }));
+    if (!amount || !paymentMethod) {
+      const locale = localeFor(ctx);
+      return void (await ctx.reply(locale === 'en' ? 'Invalid top-up request. Choose the amount again.' : '充值请求无效，请重新选择金额。', { reply_markup: menu(locale) }));
+    }
     await handleTopUpQuote(ctx, deps, amount, paymentMethod);
   });
   bot.callbackQuery(/^topup:crypto:(\d{1,15})$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const amount = parseTopUpAmount(ctx.match?.[1]);
-    if (!amount) return void (await ctx.reply('充值请求无效，请重新选择金额。', { reply_markup: menu() }));
+    if (!amount) {
+      const locale = localeFor(ctx);
+      return void (await ctx.reply(locale === 'en' ? 'Invalid top-up request. Choose the amount again.' : '充值请求无效，请重新选择金额。', { reply_markup: menu(locale) }));
+    }
     await showCryptoAssets(ctx, await getTopUpOptions(ctx, deps), amount);
   });
   bot.callbackQuery(/^topup:crypto:asset:(\d{1,15}):(USDT|USDC)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const amount = parseTopUpAmount(ctx.match?.[1]);
     const asset = ctx.match?.[2] as CryptoAsset | undefined;
-    if (!amount || !asset) return void (await ctx.reply('充值请求无效，请重新选择金额。', { reply_markup: menu() }));
+    if (!amount || !asset) {
+      const locale = localeFor(ctx);
+      return void (await ctx.reply(locale === 'en' ? 'Invalid top-up request. Choose the amount again.' : '充值请求无效，请重新选择金额。', { reply_markup: menu(locale) }));
+    }
     await showCryptoNetworks(ctx, await getTopUpOptions(ctx, deps), amount, asset);
   });
   bot.callbackQuery(/^topup:crypto:network:(\d{1,15}):(USDT|USDC):(bsc|ethereum|base|solana)$/, async (ctx) => {
@@ -307,14 +352,20 @@ export function createBot(deps: BotDependencies): Bot {
     const amount = parseTopUpAmount(ctx.match?.[1]);
     const asset = ctx.match?.[2] as CryptoAsset | undefined;
     const network = ctx.match?.[3] as CryptoNetwork | undefined;
-    if (!amount || !asset || !network) return void (await ctx.reply('充值请求无效，请重新选择金额。', { reply_markup: menu() }));
+    if (!amount || !asset || !network) {
+      const locale = localeFor(ctx);
+      return void (await ctx.reply(locale === 'en' ? 'Invalid top-up request. Choose the amount again.' : '充值请求无效，请重新选择金额。', { reply_markup: menu(locale) }));
+    }
     await handleTopUpQuote(ctx, deps, amount, 'crypto', { asset, network });
   });
   bot.callbackQuery(/^topup:create:(\d{1,15}):(alipay|wxpay)$/, async (ctx) => {
     await ctx.answerCallbackQuery();
     const amount = parseTopUpAmount(ctx.match?.[1]);
     const paymentMethod = ctx.match?.[2] as TopUpPaymentMethod['type'] | undefined;
-    if (!amount || !paymentMethod) return void (await ctx.reply('充值请求无效，请重新选择金额。', { reply_markup: menu() }));
+    if (!amount || !paymentMethod) {
+      const locale = localeFor(ctx);
+      return void (await ctx.reply(locale === 'en' ? 'Invalid top-up request. Choose the amount again.' : '充值请求无效，请重新选择金额。', { reply_markup: menu(locale) }));
+    }
     await handleTopUpOrderCreate(ctx, deps, amount, paymentMethod);
   });
   bot.callbackQuery(/^topup:crypto:create:(\d{1,15}):(USDT|USDC):(bsc|ethereum|base|solana)$/, async (ctx) => {
@@ -322,7 +373,10 @@ export function createBot(deps: BotDependencies): Bot {
     const amount = parseTopUpAmount(ctx.match?.[1]);
     const asset = ctx.match?.[2] as CryptoAsset | undefined;
     const network = ctx.match?.[3] as CryptoNetwork | undefined;
-    if (!amount || !asset || !network) return void (await ctx.reply('充值请求无效，请重新选择金额。', { reply_markup: menu() }));
+    if (!amount || !asset || !network) {
+      const locale = localeFor(ctx);
+      return void (await ctx.reply(locale === 'en' ? 'Invalid top-up request. Choose the amount again.' : '充值请求无效，请重新选择金额。', { reply_markup: menu(locale) }));
+    }
     await handleTopUpOrderCreate(ctx, deps, amount, 'crypto', { asset, network });
   });
   bot.callbackQuery(/^topup:status:([A-Za-z0-9]{1,48})$/, async (ctx) => {
@@ -331,7 +385,8 @@ export function createBot(deps: BotDependencies): Bot {
   });
   bot.callbackQuery('topup:cancel', async (ctx) => {
     await ctx.answerCallbackQuery();
-    await ctx.reply('已取消本次充值操作。', { reply_markup: menu() });
+    const locale = localeFor(ctx);
+    await ctx.reply(locale === 'en' ? 'Top-up cancelled.' : '已取消本次充值操作。', { reply_markup: menu(locale) });
   });
   bot.callbackQuery('resources', async (ctx) => {
     await ctx.answerCallbackQuery();
@@ -369,14 +424,9 @@ export function createBot(deps: BotDependencies): Bot {
     await ctx.answerCallbackQuery();
     await clearNotificationThreshold(ctx, deps);
   });
-  bot.callbackQuery('broadcast:confirm', async (ctx) => {
+  bot.callbackQuery(/^broadcast:(confirm|status|pause|resume|cancel):(BC-[A-F0-9]{12})$/, async (ctx) => {
     await ctx.answerCallbackQuery();
-    await confirmBroadcast(ctx, deps);
-  });
-  bot.callbackQuery('broadcast:cancel', async (ctx) => {
-    await ctx.answerCallbackQuery();
-    if (ctx.from) pendingBroadcasts.delete(String(ctx.from.id));
-    await ctx.reply('已取消广播。');
+    await handleBroadcastAction(ctx, deps, ctx.match?.[1] ?? '', ctx.match?.[2] ?? '');
   });
 
   bot.on('message:text', async (ctx) => {
@@ -384,6 +434,36 @@ export function createBot(deps: BotDependencies): Bot {
   });
 
   return bot;
+}
+
+function rateLimitScope(ctx: Context): RateLimitScope | undefined {
+  const command = ctx.message?.text?.trim().split(/\s+/, 1)[0]?.toLowerCase().split('@', 1)[0];
+  const callback = ctx.callbackQuery?.data;
+  if (command === '/bind' || callback === 'bind') return 'bind';
+  if (command === '/support' || callback === 'support') return 'support';
+  if (command === '/admin' || command === '/broadcast' || command === '/close' || callback?.startsWith('broadcast:')) return 'admin';
+  return undefined;
+}
+
+function consumeRateLimit(
+  buckets: Map<string, RateLimitBucket>,
+  key: string,
+  rule: { limit: number; windowMs: number },
+  now = Date.now(),
+): boolean {
+  const current = buckets.get(key);
+  if (!current || current.resetsAt <= now) {
+    buckets.set(key, { count: 1, resetsAt: now + rule.windowMs });
+    if (buckets.size > 10_000) {
+      for (const [bucketKey, bucket] of buckets) {
+        if (bucket.resetsAt <= now) buckets.delete(bucketKey);
+      }
+    }
+    return true;
+  }
+  if (current.count >= rule.limit) return false;
+  current.count += 1;
+  return true;
 }
 
 async function showLanguageSelector(ctx: Context, locale: Locale): Promise<void> {
@@ -435,12 +515,15 @@ async function handleSettings(ctx: Context, deps: BotDependencies): Promise<void
   if (!identity) return;
   const locale = localeFor(ctx);
   try {
-    const preference = await deps.repository.getNotificationPreference(identity.telegramUserId);
+    const [preference, status] = await Promise.all([
+      deps.repository.getNotificationPreference(identity.telegramUserId),
+      getOptionalStatus(deps),
+    ]);
     const keyboard = new InlineKeyboard()
       .text(preference.paused ? (locale === 'en' ? 'Resume notifications' : '恢复通知') : (locale === 'en' ? 'Pause notifications' : '暂停通知'), 'settings:pause')
       .text(locale === 'en' ? 'Clear low-balance alert' : '关闭低余额提醒', 'settings:clear').row()
-      .text(locale === 'en' ? 'Help: /notify 100000' : '帮助：/notify 100000', 'help');
-    await ctx.reply(`${formatNotificationPreference(preference, locale)}\n\n${locale === 'en' ? 'Use /notify <quota> to set a low-balance threshold.' : '使用 /notify <额度> 设置低余额阈值。'}`, {
+      .text(locale === 'en' ? 'Help: /notify 50' : '帮助：/notify 50', 'help');
+    await ctx.reply(`${formatNotificationPreference(preference, locale, status)}\n\n${locale === 'en' ? 'Use /notify <amount> to set a low-balance threshold in the displayed account unit.' : '使用 /notify <金额> 按账户当前展示单位设置低余额阈值。'}`, {
       reply_markup: keyboard,
     });
   } catch (error) {
@@ -463,19 +546,21 @@ async function handleNotify(ctx: Context, deps: BotDependencies): Promise<void> 
     const updated = { ...preference, paused: argument === 'pause', updatedAt: new Date() };
     await deps.repository.saveNotificationPreference(updated);
     await deps.repository.writeAudit({ actorTelegramUserId: identity.telegramUserId, action: `notification.${argument}` });
-    await ctx.reply(formatNotificationPreference(updated, locale), { reply_markup: menu(locale) });
+    await ctx.reply(formatNotificationPreference(updated, locale, await getOptionalStatus(deps)), { reply_markup: menu(locale) });
     return;
   }
   if (argument === 'off') {
     const updated: NotificationPreference = { ...preference, lowQuotaThreshold: undefined, updatedAt: new Date() };
     await deps.repository.saveNotificationPreference(updated);
     await deps.repository.writeAudit({ actorTelegramUserId: identity.telegramUserId, action: 'notification.threshold_cleared' });
-    await ctx.reply(formatNotificationPreference(updated, locale), { reply_markup: menu(locale) });
+    await ctx.reply(formatNotificationPreference(updated, locale, await getOptionalStatus(deps)), { reply_markup: menu(locale) });
     return;
   }
-  const threshold = Number(argument);
-  if (!Number.isSafeInteger(threshold) || threshold < 0) {
-    await ctx.reply(locale === 'en' ? 'Usage: /notify 100000, /notify off, /notify pause, or /notify resume' : '格式：/notify 100000、/notify off、/notify pause 或 /notify resume');
+  const displayAmount = Number(argument);
+  const status = await getOptionalStatus(deps);
+  const threshold = status ? quotaFromDisplayAmount(displayAmount, status) : undefined;
+  if (threshold === undefined) {
+    await ctx.reply(locale === 'en' ? 'Usage: /notify 50, /notify off, /notify pause, or /notify resume' : '格式：/notify 50、/notify off、/notify pause 或 /notify resume');
     return;
   }
   const updated: NotificationPreference = { ...preference, lowQuotaThreshold: threshold, updatedAt: new Date() };
@@ -485,7 +570,7 @@ async function handleNotify(ctx: Context, deps: BotDependencies): Promise<void> 
     action: 'notification.threshold_set',
     metadata: { threshold },
   });
-  await ctx.reply(formatNotificationPreference(updated, locale), { reply_markup: menu(locale) });
+  await ctx.reply(formatNotificationPreference(updated, locale, status), { reply_markup: menu(locale) });
 }
 
 async function toggleNotificationPause(ctx: Context, deps: BotDependencies): Promise<void> {
@@ -496,7 +581,11 @@ async function toggleNotificationPause(ctx: Context, deps: BotDependencies): Pro
   const preference = await deps.repository.getNotificationPreference(identity.telegramUserId);
   const updated = { ...preference, paused: !preference.paused, updatedAt: new Date() };
   await deps.repository.saveNotificationPreference(updated);
-  await ctx.reply(formatNotificationPreference(updated, locale), { reply_markup: menu(locale) });
+  await deps.repository.writeAudit({
+    actorTelegramUserId: identity.telegramUserId,
+    action: updated.paused ? 'notification.pause' : 'notification.resume',
+  });
+  await ctx.reply(formatNotificationPreference(updated, locale, await getOptionalStatus(deps)), { reply_markup: menu(locale) });
 }
 
 async function clearNotificationThreshold(ctx: Context, deps: BotDependencies): Promise<void> {
@@ -507,7 +596,8 @@ async function clearNotificationThreshold(ctx: Context, deps: BotDependencies): 
   const preference = await deps.repository.getNotificationPreference(identity.telegramUserId);
   const updated: NotificationPreference = { ...preference, lowQuotaThreshold: undefined, updatedAt: new Date() };
   await deps.repository.saveNotificationPreference(updated);
-  await ctx.reply(formatNotificationPreference(updated, locale), { reply_markup: menu(locale) });
+  await deps.repository.writeAudit({ actorTelegramUserId: identity.telegramUserId, action: 'notification.threshold_cleared' });
+  await ctx.reply(formatNotificationPreference(updated, locale, await getOptionalStatus(deps)), { reply_markup: menu(locale) });
 }
 
 async function handleSupport(ctx: Context, deps: BotDependencies): Promise<void> {
@@ -604,38 +694,103 @@ async function handleBroadcast(ctx: Context, deps: BotDependencies): Promise<voi
   const safeMessage = message.length > 3500 ? `${message.slice(0, 3497)}...` : message;
   const targets = await deps.repository.listActiveBindings();
   const adminId = String(ctx.from?.id);
-  pendingBroadcasts.set(adminId, safeMessage);
-  await ctx.reply(`广播预览\n目标人数：${targets.length}\n\n${safeMessage}\n\n确认发送？`, {
-    reply_markup: new InlineKeyboard().text('确认发送', 'broadcast:confirm').text('取消', 'broadcast:cancel'),
+  const broadcast = await deps.repository.createBroadcastDraft({
+    id: `BC-${randomUUID().replaceAll('-', '').slice(0, 12).toUpperCase()}`,
+    adminTelegramUserId: adminId,
+    message: safeMessage,
+    recipients: targets.map((target) => ({
+      telegramUserId: target.user.telegramUserId,
+      chatId: target.user.chatId,
+    })),
+  });
+  await deps.repository.writeAudit({
+    actorTelegramUserId: adminId,
+    action: 'broadcast.drafted',
+    targetType: 'broadcast',
+    targetId: broadcast.id,
+    metadata: { targetCount: broadcast.targetCount },
+  });
+  await ctx.reply(`广播预览\n\n${formatBroadcast(broadcast)}\n\n确认后由后台任务投递。`, {
+    reply_markup: broadcastKeyboard(broadcast),
   });
 }
 
-async function confirmBroadcast(ctx: Context, deps: BotDependencies): Promise<void> {
+async function handleBroadcastAction(
+  ctx: Context,
+  deps: BotDependencies,
+  action: string,
+  broadcastId: string,
+): Promise<void> {
   if (!isPrivate(ctx)) return void (await ctx.reply(privateOnly));
   if (!isAdmin(ctx, deps)) return void (await ctx.reply('无权执行此操作。'));
   const adminId = String(ctx.from?.id);
-  const message = pendingBroadcasts.get(adminId);
-  if (!message) return void (await ctx.reply('广播已过期，请重新使用 /broadcast。'));
-  pendingBroadcasts.delete(adminId);
-  const targets = await deps.repository.listActiveBindings();
-  let delivered = 0;
-  let failed = 0;
-  for (const target of targets) {
-    try {
-      await sendMessageWithRetry(ctx.api, target.user.chatId, message);
-      delivered += 1;
-    } catch (error) {
-      failed += 1;
-      deps.logger.warn({ err: error, telegramUserId: target.user.telegramUserId }, 'broadcast delivery failed');
-    }
-    if (deps.config.broadcastDelayMs > 0) await new Promise((resolve) => setTimeout(resolve, deps.config.broadcastDelayMs));
+  let broadcast: Broadcast | null;
+  let result: string;
+  switch (action) {
+    case 'confirm':
+      broadcast = await deps.repository.queueBroadcast(broadcastId, adminId);
+      result = '广播已加入后台队列。';
+      break;
+    case 'pause':
+      broadcast = await deps.repository.pauseBroadcast(broadcastId, adminId);
+      result = '广播已暂停；已完成的投递不会撤回。';
+      break;
+    case 'resume':
+      broadcast = await deps.repository.resumeBroadcast(broadcastId, adminId);
+      result = '广播已恢复后台投递。';
+      break;
+    case 'cancel':
+      broadcast = await deps.repository.cancelBroadcast(broadcastId, adminId);
+      result = '广播已取消；已完成或正在发送的消息无法撤回。';
+      break;
+    case 'status':
+      broadcast = await deps.repository.getBroadcast(broadcastId, adminId);
+      result = '广播状态';
+      break;
+    default:
+      return void (await ctx.reply('无效的广播操作。'));
   }
-  await deps.repository.writeAudit({
-    actorTelegramUserId: adminId,
-    action: 'broadcast.sent',
-    metadata: { targetCount: targets.length, delivered, failed },
-  });
-  await ctx.reply(`广播完成\n成功：${delivered}\n失败：${failed}`);
+  if (!broadcast) {
+    await ctx.reply('广播不存在、无权操作，或状态已经变化。');
+    return;
+  }
+  if (action !== 'status') {
+    await deps.repository.writeAudit({
+      actorTelegramUserId: adminId,
+      action: `broadcast.${action === 'confirm' ? 'queued' : action === 'cancel' ? 'cancelled' : action}`,
+      targetType: 'broadcast',
+      targetId: broadcast.id,
+      metadata: { targetCount: broadcast.targetCount, delivered: broadcast.delivered, failed: broadcast.failed },
+    });
+  }
+  if (action === 'confirm' || action === 'resume') deps.onBroadcastQueued?.();
+  await ctx.reply(`${result}\n\n${formatBroadcast(broadcast)}`, { reply_markup: broadcastKeyboard(broadcast) });
+}
+
+function formatBroadcast(broadcast: Broadcast): string {
+  return `编号：${broadcast.id}\n状态：${broadcastStatusLabel(broadcast.status)}\n目标人数：${broadcast.targetCount}\n已成功：${broadcast.delivered}\n最终失败：${broadcast.failed}\n\n公告内容：\n${broadcast.message}`;
+}
+
+function broadcastStatusLabel(status: Broadcast['status']): string {
+  return {
+    draft: '待确认', queued: '排队中', running: '发送中', paused: '已暂停', completed: '已完成', cancelled: '已取消',
+  }[status];
+}
+
+function broadcastKeyboard(broadcast: Broadcast): InlineKeyboard {
+  const keyboard = new InlineKeyboard();
+  if (broadcast.status === 'draft') {
+    keyboard.text('确认发送', `broadcast:confirm:${broadcast.id}`).text('取消', `broadcast:cancel:${broadcast.id}`);
+  } else if (broadcast.status === 'queued' || broadcast.status === 'running') {
+    keyboard.text('刷新状态', `broadcast:status:${broadcast.id}`).text('暂停', `broadcast:pause:${broadcast.id}`).row()
+      .text('取消', `broadcast:cancel:${broadcast.id}`);
+  } else if (broadcast.status === 'paused') {
+    keyboard.text('刷新状态', `broadcast:status:${broadcast.id}`).text('恢复', `broadcast:resume:${broadcast.id}`).row()
+      .text('取消', `broadcast:cancel:${broadcast.id}`);
+  } else {
+    keyboard.text('刷新状态', `broadcast:status:${broadcast.id}`);
+  }
+  return keyboard.row().text('返回菜单', 'menu');
 }
 
 async function handleBind(ctx: Context, deps: BotDependencies): Promise<void> {
@@ -694,8 +849,8 @@ async function handleAccount(ctx: Context, deps: BotDependencies): Promise<void>
     const status = await getStatus(deps);
     await ctx.reply(
       locale === 'en'
-        ? `Account: ${account.displayName ?? account.username}\nGroup: ${account.group ?? '-'}\nStatus: ${account.status === 1 ? 'Active' : 'Unavailable'}\nTotal quota: ${formatQuota(account.quota, status)}\nUsed quota: ${formatQuota(account.usedQuota, status)}\nRemaining quota: ${formatQuota(account.quota - account.usedQuota, status)}\nRequests: ${account.requestCount ?? '-'}`
-        : `账户：${account.displayName ?? account.username}\n用户组：${account.group ?? '-'}\n状态：${account.status === 1 ? '正常' : '不可用'}\n总额度：${formatQuota(account.quota, status)}\n已用额度：${formatQuota(account.usedQuota, status)}\n剩余额度：${formatQuota(account.quota - account.usedQuota, status)}\n请求数：${account.requestCount ?? '-'}`,
+        ? `Account: ${account.displayName ?? account.username}\nGroup: ${account.group ?? '-'}\nStatus: ${account.status === 1 ? 'Active' : 'Unavailable'}\nAvailable balance: ${formatQuota(account.quota, status)}\nHistorical usage: ${formatQuota(account.usedQuota, status)}\nRequests: ${account.requestCount ?? '-'}`
+        : `账户：${account.displayName ?? account.username}\n用户组：${account.group ?? '-'}\n状态：${account.status === 1 ? '正常' : '不可用'}\n当前余额：${formatQuota(account.quota, status)}\n历史已用：${formatQuota(account.usedQuota, status)}\n请求数：${account.requestCount ?? '-'}`,
       { reply_markup: menu(locale) },
     );
   } catch (error) {
@@ -743,11 +898,9 @@ async function handleAvailableModels(ctx: Context, deps: BotDependencies, cursor
     const page = accountScoped
       ? await deps.newApi.getAvailableModels(String(ctx.from.id), cursor)
       : await deps.newApi.getPublicModels(cursor);
+    const pricingStatus = accountScoped ? undefined : await getOptionalStatus(deps);
     const locale = localeFor(ctx);
-    const rows = page.models.map((model) => {
-      const endpointTypes = model.endpointTypes.length > 0 ? ` (${model.endpointTypes.join(', ')})` : '';
-      return `- ${model.id}${endpointTypes}`;
-    });
+    const rows = page.models.map((model) => formatModelCatalogueRow(model, locale, pricingStatus));
     const heading = accountScoped
       ? locale === 'en' ? `Available models (${page.total})` : `当前账户可用模型（${page.total}）`
       : locale === 'en' ? `Public model catalogue (${page.total})` : `公开模型目录（${page.total}）`;
@@ -755,19 +908,42 @@ async function handleAvailableModels(ctx: Context, deps: BotDependencies, cursor
     const scopeNotice = accountScoped
       ? ''
       : locale === 'en'
-        ? '\n\nThis is the public catalogue. Your available models and final prices depend on your account group; check the web portal for the authoritative result.'
-        : '\n\n这是站点公开目录。你的实际可用模型和最终价格取决于账号分组，请以网页账户中心为准。';
+        ? '\n\nWhere shown, prices are public minimum standard prices. They are not an account quote: availability and final charges depend on your account group and request parameters. Use the web portal as the authority.'
+        : '\n\n列表中的价格仅为公开目录可计算出的最低标准价，不是账号报价；实际可用模型和最终扣费受账号分组及请求参数影响，请以网页账户中心为准。';
     const keyboard = new InlineKeyboard();
     if (page.nextCursor) keyboard.text(locale === 'en' ? 'Next page' : '下一页', `models:${page.nextCursor}`).row();
     keyboard.url(t(locale, 'modelSquare'), deps.config.newApiPricingUrl).row().text(t(locale, 'returnToMenu'), 'menu');
     await ctx.reply(`${heading}\n\n${rows.length > 0 ? rows.join('\n') : empty}${scopeNotice}`, { reply_markup: keyboard });
   } catch (error) {
     if (error instanceof NewApiError && error.code === 'api' && error.message === 'telegram account is not bound') {
-      await ctx.reply('请先绑定 SuperToken 账号后再查看可用模型。', { reply_markup: menu() });
+      const locale = localeFor(ctx);
+      await ctx.reply(locale === 'en' ? 'Link your SuperToken account before viewing available models.' : '请先绑定 SuperToken 账号后再查看可用模型。', { reply_markup: menu(locale) });
       return;
     }
     await ctx.reply(localeFor(ctx) === 'en' ? 'The model catalogue is temporarily unavailable.' : '模型目录暂时不可用，请稍后重试。', { reply_markup: menu(localeFor(ctx)) });
   }
+}
+
+function formatModelCatalogueRow(
+  model: { id: string; endpointTypes: string[]; cataloguePrice?: CataloguePrice },
+  locale: Locale,
+  pricingStatus?: NewApiStatus,
+): string {
+  const endpointTypes = model.endpointTypes.length > 0 ? ` (${model.endpointTypes.join(', ')})` : '';
+  const price = model.cataloguePrice ? `\n  ${cataloguePriceLabel(model.cataloguePrice, locale, pricingStatus)}` : '';
+  const row = `- ${model.id}${endpointTypes}${price}`;
+  return row.length <= 240 ? row : `${row.slice(0, 237)}...`;
+}
+
+function cataloguePriceLabel(price: CataloguePrice, locale: Locale, pricingStatus?: NewApiStatus): string {
+  const prefix = locale === 'en' ? 'Public minimum: ' : '公开最低价：';
+  if (price.kind === 'dynamic') {
+    return locale === 'en' ? `${prefix}dynamic pricing, see Model Square` : `${prefix}动态计费，请查看模型广场`;
+  }
+  if (price.kind === 'request') {
+    return `${prefix}${formatBillingPrice(price.usdPerRequest, pricingStatus)} / ${locale === 'en' ? 'request' : '次请求'}`;
+  }
+  return `${prefix}${formatBillingPrice(price.inputUsdPerMillion, pricingStatus)} / ${formatBillingPrice(price.outputUsdPerMillion, pricingStatus)} / 1M tokens (${locale === 'en' ? 'input/output' : '输入/输出'})`;
 }
 
 function apiKeyStatusLabel(locale: Locale, status: ApiKey['status']): string {
@@ -792,7 +968,7 @@ function formatApiKey(key: ApiKey, locale: Locale): string {
     `${labels.key}: ${key.maskedKey}`,
     `${labels.profile}: ${group}`,
     `${labels.status}: ${apiKeyStatusLabel(locale, key.status)}`,
-    `${labels.expires}: ${formatTimestamp(key.expiresAt)}`,
+    `${labels.expires}: ${formatTimestamp(key.expiresAt, locale)}`,
   ].join('\n');
 }
 
@@ -1019,21 +1195,28 @@ function topUpMethodMinimum(options: TopUpOptions, method: TopUpPaymentMethod): 
   return Math.max(options.minTopup, method.minTopup ?? 0);
 }
 
-function topUpUnavailableMessage(error?: unknown): string {
+function topUpUnavailableMessage(error: unknown, locale: Locale): string {
   if (error instanceof NewApiError && error.code === 'api' && error.message === 'telegram account is not bound') {
-    return '请先在 new-api 网页完成 Telegram 绑定后再充值。';
+    return locale === 'en'
+      ? 'Link Telegram in the new-api web portal before topping up.'
+      : '请先在 new-api 网页完成 Telegram 绑定后再充值。';
   }
   if (error instanceof NewApiError && error.code === 'config') {
-    return '充值功能需要 Bridge 集成配置。';
+    return locale === 'en' ? 'Top-up requires the Bridge integration.' : '充值功能需要 Bridge 集成配置。';
   }
-  return '充值暂不可用，请稍后重试。';
+  return locale === 'en' ? 'Top-up is temporarily unavailable.' : '充值暂不可用，请稍后重试。';
 }
 
-async function showOfficialTopUpPortal(ctx: Context, deps: BotDependencies): Promise<void> {
+async function showTopUpPortal(ctx: Context, deps: BotDependencies): Promise<void> {
   const locale = localeFor(ctx);
-  const text = locale === 'en'
-    ? 'Top up\n\nThis Bot is connected through official new-api APIs. Payment initiation and payment status are handled in the authenticated web portal, so the Bot does not collect payment details, wallet addresses, or transaction hashes.'
-    : '充值中心\n\n当前 Bot 使用原生 new-api 接口。支付建单与到账状态仅在已登录的网页账户中心处理，机器人不会收集支付凭证、钱包地址或交易哈希。';
+  const officialMode = deps.config.newApiIntegrationMode === 'admin';
+  const text = officialMode
+    ? locale === 'en'
+      ? 'Top up\n\nThis Bot is connected through official new-api APIs. Payment initiation and payment status are handled in the authenticated web portal, so the Bot does not collect payment details, wallet addresses, or transaction hashes.'
+      : '充值中心\n\n当前 Bot 使用原生 new-api 接口。支付建单与到账状态仅在已登录的网页账户中心处理，机器人不会收集支付凭证、钱包地址或交易哈希。'
+    : locale === 'en'
+      ? 'Top up\n\nTelegram checkout is currently disabled. Use the authenticated web portal to create and review payments.'
+      : '充值中心\n\nTelegram 内充值当前未启用，请前往已登录的网页账户中心创建并查看支付。';
   await ctx.reply(text, {
     reply_markup: new InlineKeyboard()
       .url(locale === 'en' ? 'Open top-up portal' : '打开充值页面', deps.config.newApiTopupUrl)
@@ -1043,32 +1226,36 @@ async function showOfficialTopUpPortal(ctx: Context, deps: BotDependencies): Pro
 }
 
 async function getTopUpOptions(ctx: Context, deps: BotDependencies): Promise<TopUpOptions | null> {
-  if (deps.config.newApiIntegrationMode !== 'bridge') {
-    await showOfficialTopUpPortal(ctx, deps);
+  const locale = localeFor(ctx);
+  if (deps.config.newApiIntegrationMode !== 'bridge' || deps.config.telegramTopUpMode === 'disabled') {
+    await showTopUpPortal(ctx, deps);
     return null;
   }
   if (!ctx.from) return null;
   try {
     const options = await deps.newApi.getTopUpOptions(String(ctx.from.id));
     if (!options.enabled || options.paymentMethods.length === 0) {
-      await ctx.reply('充值暂未开放，请稍后重试。', { reply_markup: menu() });
+      await ctx.reply(locale === 'en' ? 'Top-up is not available yet.' : '充值暂未开放，请稍后重试。', { reply_markup: menu(locale) });
       return null;
     }
     return options;
   } catch (error) {
-    await ctx.reply(topUpUnavailableMessage(error), { reply_markup: menu() });
+    await ctx.reply(topUpUnavailableMessage(error, locale), { reply_markup: menu(locale) });
     return null;
   }
 }
 
 async function handleTopUp(ctx: Context, deps: BotDependencies, requestedAmount?: number): Promise<void> {
   if (!isPrivate(ctx)) return void (await ctx.reply(privateOnly));
-  if (deps.config.newApiIntegrationMode !== 'bridge') return showOfficialTopUpPortal(ctx, deps);
+  if (deps.config.newApiIntegrationMode !== 'bridge' || deps.config.telegramTopUpMode === 'disabled') return showTopUpPortal(ctx, deps);
+  const locale = localeFor(ctx);
   const options = await getTopUpOptions(ctx, deps);
   if (!options) return;
   if (requestedAmount !== undefined) {
     if (requestedAmount < options.minTopup) {
-      await ctx.reply(`充值金额不能低于 ${formatTopUpAmount(options.minTopup, options.displayType)}。`, { reply_markup: menu() });
+      await ctx.reply(locale === 'en'
+        ? `The top-up amount cannot be less than ${formatTopUpAmount(options.minTopup, options.displayType)}.`
+        : `充值金额不能低于 ${formatTopUpAmount(options.minTopup, options.displayType)}。`, { reply_markup: menu(locale) });
       return;
     }
     await showTopUpMethods(ctx, options, requestedAmount);
@@ -1086,17 +1273,20 @@ async function handleTopUp(ctx: Context, deps: BotDependencies, requestedAmount?
     if (index % 2 === 1) keyboard.row();
   }
   if (amounts.length % 2 === 1) keyboard.row();
-  keyboard.text('自定义金额', 'topup:custom').row().text('返回菜单', 'menu');
+  keyboard.text(locale === 'en' ? 'Custom amount' : '自定义金额', 'topup:custom').row().text(t(locale, 'returnToMenu'), 'menu');
   await ctx.reply(
-    `充值中心\n最低充值额度：${formatTopUpAmount(options.minTopup, options.displayType)}\n请选择金额，或发送 /topup <整数金额>。`,
+    locale === 'en'
+      ? `Top up\nMinimum amount: ${formatTopUpAmount(options.minTopup, options.displayType)}\nChoose an amount, or send /topup <integer amount>.`
+      : `充值中心\n最低充值额度：${formatTopUpAmount(options.minTopup, options.displayType)}\n请选择金额，或发送 /topup <整数金额>。`,
     { reply_markup: keyboard },
   );
 }
 
 async function showTopUpMethods(ctx: Context, options: TopUpOptions, amount: number): Promise<void> {
+  const locale = localeFor(ctx);
   const available = options.paymentMethods.filter((method) => amount >= topUpMethodMinimum(options, method));
   if (available.length === 0) {
-    await ctx.reply('所选金额未满足当前支付方式的最低限制，请选择更高金额。', { reply_markup: menu() });
+    await ctx.reply(locale === 'en' ? 'The selected amount is below every available payment method minimum.' : '所选金额未满足当前支付方式的最低限制，请选择更高金额。', { reply_markup: menu(locale) });
     return;
   }
   const keyboard = new InlineKeyboard();
@@ -1107,22 +1297,27 @@ async function showTopUpMethods(ctx: Context, options: TopUpOptions, amount: num
       keyboard.text(method.name, `topup:quote:${amount}:${method.type}`);
     }
   }
-  keyboard.row().text('重新选择金额', 'topup').text('取消', 'topup:cancel');
-  await ctx.reply(`充值额度：${formatTopUpAmount(amount, options.displayType)}\n请选择支付方式：`, { reply_markup: keyboard });
+  keyboard.row().text(locale === 'en' ? 'Choose amount again' : '重新选择金额', 'topup').text(locale === 'en' ? 'Cancel' : '取消', 'topup:cancel');
+  await ctx.reply(locale === 'en'
+    ? `Top-up credit: ${formatTopUpAmount(amount, options.displayType)}\nChoose a payment method:`
+    : `充值额度：${formatTopUpAmount(amount, options.displayType)}\n请选择支付方式：`, { reply_markup: keyboard });
 }
 
 async function showCryptoAssets(ctx: Context, options: TopUpOptions | null, amount: number): Promise<void> {
   if (!options) return;
+  const locale = localeFor(ctx);
   const crypto = options.paymentMethods.find((method) => method.type === 'crypto');
   if (!crypto || amount < topUpMethodMinimum(options, crypto) || !crypto.cryptoNetworks) {
-    await ctx.reply('链上充值暂时不可用，请重新选择支付方式。', { reply_markup: menu() });
+    await ctx.reply(locale === 'en' ? 'Stablecoin top-up is unavailable. Choose another payment method.' : '链上充值暂时不可用，请重新选择支付方式。', { reply_markup: menu(locale) });
     return;
   }
   const assets = [...new Set(crypto.cryptoNetworks.flatMap((network) => network.assets))];
   const keyboard = new InlineKeyboard();
   for (const asset of assets) keyboard.text(asset, `topup:crypto:asset:${amount}:${asset}`);
-  keyboard.row().text('重新选择支付方式', `topup:amount:${amount}`).text('取消', 'topup:cancel');
-  await ctx.reply(`链上充值\n充值额度：${formatTopUpAmount(amount, options.displayType)}\n请选择稳定币：`, { reply_markup: keyboard });
+  keyboard.row().text(locale === 'en' ? 'Back to methods' : '重新选择支付方式', `topup:amount:${amount}`).text(locale === 'en' ? 'Cancel' : '取消', 'topup:cancel');
+  await ctx.reply(locale === 'en'
+    ? `Stablecoin top-up\nTop-up credit: ${formatTopUpAmount(amount, options.displayType)}\nChoose an asset:`
+    : `链上充值\n充值额度：${formatTopUpAmount(amount, options.displayType)}\n请选择稳定币：`, { reply_markup: keyboard });
 }
 
 async function showCryptoNetworks(
@@ -1132,18 +1327,21 @@ async function showCryptoNetworks(
   asset: CryptoAsset,
 ): Promise<void> {
   if (!options) return;
+  const locale = localeFor(ctx);
   const crypto = options.paymentMethods.find((method) => method.type === 'crypto');
   const networks = crypto?.cryptoNetworks?.filter((network) => network.assets.includes(asset)) ?? [];
   if (networks.length === 0) {
-    await ctx.reply('所选稳定币当前没有可用网络，请重新选择。', { reply_markup: menu() });
+    await ctx.reply(locale === 'en' ? 'No network is available for the selected stablecoin.' : '所选稳定币当前没有可用网络，请重新选择。', { reply_markup: menu(locale) });
     return;
   }
   const keyboard = new InlineKeyboard();
   for (const network of networks) {
     keyboard.text(network.name, `topup:crypto:network:${amount}:${asset}:${network.network}`).row();
   }
-  keyboard.text('重新选择稳定币', `topup:crypto:${amount}`).text('取消', 'topup:cancel');
-  await ctx.reply(`${asset} 链上充值\n请选择网络。请务必使用页面显示的网络，跨链转账无法自动入账。`, { reply_markup: keyboard });
+  keyboard.text(locale === 'en' ? 'Choose asset again' : '重新选择稳定币', `topup:crypto:${amount}`).text(locale === 'en' ? 'Cancel' : '取消', 'topup:cancel');
+  await ctx.reply(locale === 'en'
+    ? `${asset} stablecoin top-up\nChoose the exact network shown here. Cross-network transfers cannot be credited automatically.`
+    : `${asset} 链上充值\n请选择网络。请务必使用页面显示的网络，跨链转账无法自动入账。`, { reply_markup: keyboard });
 }
 
 async function handleTopUpQuote(
@@ -1154,12 +1352,13 @@ async function handleTopUpQuote(
   crypto?: { asset: CryptoAsset; network: CryptoNetwork },
 ): Promise<void> {
   if (!isPrivate(ctx) || !ctx.from) return void (await ctx.reply(privateOnly));
+  const locale = localeFor(ctx);
   const options = await getTopUpOptions(ctx, deps);
   if (!options) return;
   const method = options.paymentMethods.find((candidate) => candidate.type === paymentMethod);
   const network = crypto && method?.cryptoNetworks?.find((candidate) => candidate.network === crypto.network && candidate.assets.includes(crypto.asset));
   if (!method || amount < topUpMethodMinimum(options, method) || (paymentMethod === 'crypto' && !network)) {
-    await ctx.reply('支付方式或金额已变化，请重新选择。', { reply_markup: menu() });
+    await ctx.reply(locale === 'en' ? 'The payment method or amount changed. Choose again.' : '支付方式或金额已变化，请重新选择。', { reply_markup: menu(locale) });
     return;
   }
   try {
@@ -1170,21 +1369,25 @@ async function handleTopUpQuote(
     }
     const expiresMinutes = Math.max(1, Math.ceil(quote.expiresIn / 60));
     const methodDetails = crypto && network
-      ? `${method.name}\n稳定币：${crypto.asset}\n网络：${network.name}`
+      ? locale === 'en'
+        ? `${method.name}\nAsset: ${crypto.asset}\nNetwork: ${network.name}`
+        : `${method.name}\n稳定币：${crypto.asset}\n网络：${network.name}`
       : method.name;
     const createCallback = crypto
       ? `topup:crypto:create:${amount}:${crypto.asset}:${crypto.network}`
       : `topup:create:${amount}:${paymentMethod}`;
     await ctx.reply(
-      `确认充值\n充值额度：${formatTopUpAmount(quote.topupAmount, options.displayType)}\n支付方式：${methodDetails}\n实际支付金额：${quote.payableAmount}${crypto ? ` ${crypto.asset}` : ''}\n报价有效期：约 ${expiresMinutes} 分钟\n\n确认后会创建待支付订单。`,
+      locale === 'en'
+        ? `Confirm top-up\nTop-up credit: ${formatTopUpAmount(quote.topupAmount, options.displayType)}\nPayment method: ${methodDetails}\nAmount due: ${quote.payableAmount}${crypto ? ` ${crypto.asset}` : ''}\nQuote valid for about ${expiresMinutes} minute(s)\n\nConfirmation creates a pending order.`
+        : `确认充值\n充值额度：${formatTopUpAmount(quote.topupAmount, options.displayType)}\n支付方式：${methodDetails}\n实际支付金额：${quote.payableAmount}${crypto ? ` ${crypto.asset}` : ''}\n报价有效期：约 ${expiresMinutes} 分钟\n\n确认后会创建待支付订单。`,
       {
         reply_markup: new InlineKeyboard()
-          .text('确认创建订单', createCallback).text('取消', 'topup:cancel').row()
-          .text('返回充值中心', 'topup'),
+          .text(locale === 'en' ? 'Create order' : '确认创建订单', createCallback).text(locale === 'en' ? 'Cancel' : '取消', 'topup:cancel').row()
+          .text(locale === 'en' ? 'Back to top-up' : '返回充值中心', 'topup'),
       },
     );
   } catch (error) {
-    await ctx.reply(topUpUnavailableMessage(error), { reply_markup: menu() });
+    await ctx.reply(topUpUnavailableMessage(error, locale), { reply_markup: menu(locale) });
   }
 }
 
@@ -1196,9 +1399,10 @@ async function handleTopUpOrderCreate(
   crypto?: { asset: CryptoAsset; network: CryptoNetwork },
 ): Promise<void> {
   if (!isPrivate(ctx) || !ctx.from || !ctx.callbackQuery) return void (await ctx.reply(privateOnly));
+  const locale = localeFor(ctx);
   const idempotencyKey = ctx.callbackQuery.id;
   if (!/^[A-Za-z0-9_-]{1,128}$/.test(idempotencyKey)) {
-    await ctx.reply('无法安全创建订单，请重新确认充值。', { reply_markup: menu() });
+    await ctx.reply(locale === 'en' ? 'The order cannot be created safely. Confirm the top-up again.' : '无法安全创建订单，请重新确认充值。', { reply_markup: menu(locale) });
     return;
   }
   const options = await getTopUpOptions(ctx, deps);
@@ -1206,7 +1410,7 @@ async function handleTopUpOrderCreate(
   const method = options.paymentMethods.find((candidate) => candidate.type === paymentMethod);
   const network = crypto && method?.cryptoNetworks?.find((candidate) => candidate.network === crypto.network && candidate.assets.includes(crypto.asset));
   if (!method || amount < topUpMethodMinimum(options, method) || (paymentMethod === 'crypto' && !network)) {
-    await ctx.reply('支付方式或金额已变化，请重新选择。', { reply_markup: menu() });
+    await ctx.reply(locale === 'en' ? 'The payment method or amount changed. Choose again.' : '支付方式或金额已变化，请重新选择。', { reply_markup: menu(locale) });
     return;
   }
   try {
@@ -1220,12 +1424,12 @@ async function handleTopUpOrderCreate(
       return;
     }
     if (order.checkoutUrl) {
-      await sendTopUpCheckout(ctx, deps, order, options.displayType);
+      await sendTopUpCheckout(ctx, deps, order, options.displayType, locale);
     } else {
-      await sendCryptoTopUp(ctx, deps, order, options.displayType);
+      await sendCryptoTopUp(ctx, deps, order, options.displayType, locale);
     }
   } catch (error) {
-    await ctx.reply(topUpUnavailableMessage(error), { reply_markup: menu() });
+    await ctx.reply(topUpUnavailableMessage(error, locale), { reply_markup: menu(locale) });
   }
 }
 
@@ -1234,25 +1438,31 @@ async function sendTopUpCheckout(
   deps: BotDependencies,
   order: TopUpOrder,
   displayType: TopUpOptions['displayType'],
+  locale: Locale,
 ): Promise<void> {
   if (!order.checkoutUrl) throw new NewApiError('contract', 'checkout order is missing a checkout URL');
-  const expiresAt = formatTimestamp(order.expiresAt);
+  const expiresAt = formatTimestamp(order.expiresAt, locale);
+  const mockWarning = deps.config.telegramTopUpMode === 'mock'
+    ? locale === 'en' ? '\n\nMock order. Do not make a real payment.' : '\n\nMock 测试订单，请勿真实付款。'
+    : '';
   const keyboard = new InlineKeyboard()
-    .url('打开支付页面', order.checkoutUrl).row()
-    .text('查询状态', `topup:status:${order.orderRef}`).text('充值中心', 'topup');
+    .url(locale === 'en' ? 'Open payment page' : '打开支付页面', order.checkoutUrl).row()
+    .text(locale === 'en' ? 'Check status' : '查询状态', `topup:status:${order.orderRef}`).text(locale === 'en' ? 'Top up' : '充值中心', 'topup');
   await ctx.reply(
-    `待支付订单已创建\n订单状态：等待支付\n充值额度：${formatTopUpAmount(order.topupAmount, displayType)}\n实际支付金额：${order.payableAmount}\n支付页面有效至：${expiresAt}`,
+    locale === 'en'
+      ? `Pending order created\nStatus: Awaiting payment\nTop-up credit: ${formatTopUpAmount(order.topupAmount, displayType)}\nAmount due: ${order.payableAmount}\nPayment page expires: ${expiresAt}${mockWarning}`
+      : `待支付订单已创建\n订单状态：等待支付\n充值额度：${formatTopUpAmount(order.topupAmount, displayType)}\n实际支付金额：${order.payableAmount}\n支付页面有效至：${expiresAt}${mockWarning}`,
     { reply_markup: keyboard },
   );
   try {
     const qrCode = await createCheckoutQr(order.checkoutUrl);
     await ctx.replyWithPhoto(new InputFile(qrCode, 'checkout.png'), {
-      caption: '扫描二维码打开支付页面。',
+      caption: locale === 'en' ? `Scan the QR code to open the payment page.${mockWarning}` : `扫描二维码打开支付页面。${mockWarning}`,
       reply_markup: keyboard,
     });
   } catch (error) {
     deps.logger.warn({ err: error }, 'checkout QR delivery failed');
-    await ctx.reply('二维码暂时无法发送，请使用上方按钮打开支付页面。');
+    await ctx.reply(locale === 'en' ? 'The QR code could not be sent. Use the button above.' : '二维码暂时无法发送，请使用上方按钮打开支付页面。');
   }
 }
 
@@ -1261,48 +1471,71 @@ async function sendCryptoTopUp(
   deps: BotDependencies,
   order: TopUpOrder,
   displayType: TopUpOptions['displayType'],
+  locale: Locale,
 ): Promise<void> {
   if (!order.cryptoAsset || !order.cryptoNetwork || !order.depositAddress || !order.requiredConfirmations) {
     throw new NewApiError('contract', 'crypto order is incomplete');
   }
   const networkName = cryptoNetworkLabel(order.cryptoNetwork);
-  const memo = order.depositMemo ? `\nMemo：${order.depositMemo}` : '';
+  const memo = order.depositMemo ? `\nMemo: ${order.depositMemo}` : '';
+  const mockWarning = deps.config.telegramTopUpMode === 'mock'
+    ? locale === 'en' ? '\n\nMock address. Do not send real funds.' : '\n\nMock 测试地址，不会接收或入账真实资金。'
+    : '';
   const keyboard = new InlineKeyboard()
-    .text('查询状态', `topup:status:${order.orderRef}`).text('充值中心', 'topup');
+    .text(locale === 'en' ? 'Check status' : '查询状态', `topup:status:${order.orderRef}`).text(locale === 'en' ? 'Top up' : '充值中心', 'topup');
   await ctx.reply(
-    `链上充值订单已创建\n充值额度：${formatTopUpAmount(order.topupAmount, displayType)}\n转账金额：${order.payableAmount} ${order.cryptoAsset}\n网络：${networkName}\n收款地址：\n${order.depositAddress}${memo}\n确认要求：${order.requiredConfirmations} 个区块确认\n有效至：${formatTimestamp(order.expiresAt)}\n\n请复制地址，并只通过所选网络转入所选币种。Mock 地址不会接收或入账真实资金。`,
+    locale === 'en'
+      ? `Stablecoin order created\nTop-up credit: ${formatTopUpAmount(order.topupAmount, displayType)}\nTransfer amount: ${order.payableAmount} ${order.cryptoAsset}\nNetwork: ${networkName}\nDeposit address:\n${order.depositAddress}${memo}\nRequired confirmations: ${order.requiredConfirmations}\nExpires: ${formatTimestamp(order.expiresAt, locale)}\n\nCopy the address and send only the selected asset on the selected network.${mockWarning}`
+      : `链上充值订单已创建\n充值额度：${formatTopUpAmount(order.topupAmount, displayType)}\n转账金额：${order.payableAmount} ${order.cryptoAsset}\n网络：${networkName}\n收款地址：\n${order.depositAddress}${memo}\n确认要求：${order.requiredConfirmations} 个区块确认\n有效至：${formatTimestamp(order.expiresAt, locale)}\n\n请复制地址，并只通过所选网络转入所选币种。${mockWarning}`,
     { reply_markup: keyboard },
   );
 }
 
 async function handleTopUpStatus(ctx: Context, deps: BotDependencies, orderRef: string): Promise<void> {
   if (!isPrivate(ctx) || !ctx.from) return void (await ctx.reply(privateOnly));
+  if (deps.config.newApiIntegrationMode !== 'bridge' || deps.config.telegramTopUpMode === 'disabled') return showTopUpPortal(ctx, deps);
+  const locale = localeFor(ctx);
   try {
     const status = await deps.newApi.getTopUpStatus(String(ctx.from.id), orderRef);
-    await ctx.reply(formatTopUpStatus(status), { reply_markup: topUpStatusKeyboard(status) });
+    await ctx.reply(formatTopUpStatus(status, locale), { reply_markup: topUpStatusKeyboard(status, locale) });
   } catch (error) {
-    await ctx.reply(topUpUnavailableMessage(error), { reply_markup: menu() });
+    await ctx.reply(topUpUnavailableMessage(error, locale), { reply_markup: menu(locale) });
   }
 }
 
-function formatTopUpStatus(status: TopUpStatus): string {
-  const statusText: Record<TopUpStatus['status'], string> = {
-    pending: '等待支付',
-    processing: '正在确认',
-    success: '充值已到账',
-    failed: '支付失败',
-    expired: '支付链接已过期',
+function formatTopUpStatus(status: TopUpStatus, locale: Locale): string {
+  const statusText: Record<Locale, Record<TopUpStatus['status'], string>> = {
+    zh: { pending: '等待支付', processing: '正在确认', success: '充值已到账', failed: '支付失败', expired: '支付链接已过期' },
+    en: { pending: 'Awaiting payment', processing: 'Confirming', success: 'Credited', failed: 'Payment failed', expired: 'Payment expired' },
   };
+  const paymentMethod = status.paymentMethod === 'alipay'
+    ? locale === 'en' ? 'Alipay' : '支付宝'
+    : status.paymentMethod === 'wxpay'
+      ? locale === 'en' ? 'WeChat Pay' : '微信支付'
+      : locale === 'en' ? 'Stablecoin' : '链上稳定币';
+  if (locale === 'en') {
+    const lines = [
+      `Top-up status: ${statusText.en[status.status]}`,
+      `Payment method: ${paymentMethod}`,
+      `Amount paid: ${status.payableAmount}${status.cryptoAsset ? ` ${status.cryptoAsset}` : ''}`,
+      `Created: ${formatTimestamp(status.createdAt, locale)}`,
+    ];
+    if (status.cryptoNetwork) lines.push(`Network: ${cryptoNetworkLabel(status.cryptoNetwork)}`);
+    if (status.requiredConfirmations) lines.push(`Required confirmations: ${status.requiredConfirmations}`);
+    if (status.completedAt) lines.push(`Completed: ${formatTimestamp(status.completedAt, locale)}`);
+    if (status.status === 'pending') lines.push(`Expires: ${formatTimestamp(status.expiresAt, locale)}`);
+    return lines.join('\n');
+  }
   const lines = [
-    `充值状态：${statusText[status.status]}`,
-    `支付方式：${status.paymentMethod === 'alipay' ? '支付宝' : status.paymentMethod === 'wxpay' ? '微信支付' : '链上稳定币'}`,
+    `充值状态：${statusText.zh[status.status]}`,
+    `支付方式：${paymentMethod}`,
     `实际支付金额：${status.payableAmount}${status.cryptoAsset ? ` ${status.cryptoAsset}` : ''}`,
-    `创建时间：${formatTimestamp(status.createdAt)}`,
+    `创建时间：${formatTimestamp(status.createdAt, locale)}`,
   ];
   if (status.cryptoNetwork) lines.push(`网络：${cryptoNetworkLabel(status.cryptoNetwork)}`);
   if (status.requiredConfirmations) lines.push(`确认要求：${status.requiredConfirmations} 个区块确认`);
-  if (status.completedAt) lines.push(`完成时间：${formatTimestamp(status.completedAt)}`);
-  if (status.status === 'pending') lines.push(`支付页面有效至：${formatTimestamp(status.expiresAt)}`);
+  if (status.completedAt) lines.push(`完成时间：${formatTimestamp(status.completedAt, locale)}`);
+  if (status.status === 'pending') lines.push(`支付页面有效至：${formatTimestamp(status.expiresAt, locale)}`);
   return lines.join('\n');
 }
 
@@ -1316,15 +1549,15 @@ function cryptoNetworkLabel(network: CryptoNetwork): string {
   return labels[network];
 }
 
-function topUpStatusKeyboard(status: TopUpStatus): InlineKeyboard {
+function topUpStatusKeyboard(status: TopUpStatus, locale: Locale): InlineKeyboard {
   const keyboard = new InlineKeyboard();
   if (status.status === 'pending' || status.status === 'processing') {
-    keyboard.text('刷新状态', `topup:status:${status.orderRef}`).row();
+    keyboard.text(locale === 'en' ? 'Refresh status' : '刷新状态', `topup:status:${status.orderRef}`).row();
   }
   if (status.status === 'failed' || status.status === 'expired') {
-    keyboard.text('重新充值', 'topup').row();
+    keyboard.text(locale === 'en' ? 'Top up again' : '重新充值', 'topup').row();
   }
-  return keyboard.text('返回菜单', 'menu');
+  return keyboard.text(t(locale, 'returnToMenu'), 'menu');
 }
 
 export async function createCheckoutQr(checkoutUrl: string): Promise<Buffer> {
@@ -1408,6 +1641,14 @@ async function saveBinding(ctx: Context, deps: BotDependencies, account: NewApiA
 
 async function getStatus(deps: BotDependencies): Promise<NewApiStatus> {
   return deps.newApi.getStatus();
+}
+
+async function getOptionalStatus(deps: BotDependencies): Promise<NewApiStatus | undefined> {
+  try {
+    return await getStatus(deps);
+  } catch {
+    return undefined;
+  }
 }
 
 function bindFailureMessage(error: unknown, bridge: boolean, locale: Locale = 'zh'): string {

@@ -2,7 +2,7 @@
 
 ## 1. 已确认实现
 
-当前是一个 Node.js + TypeScript 模块化单体：同一进程在 Long Polling 或 Webhook 模式下处理 Telegram Update，并运行通知定时任务。没有 Redis、BullMQ、Drizzle ORM 或独立 Worker 进程；这些不应被文档写成已经存在的能力。
+当前是一个 Node.js + TypeScript 模块化单体：同一进程在 Long Polling 或 Webhook 模式下运行 Bot、通知定时任务和 Telegram Update 队列 Worker。Webhook 先写入本地持久队列并响应，Worker 再串行处理 Update。没有 Redis、BullMQ、Drizzle ORM 或独立 Worker 进程；这些不应被文档写成已经存在的能力。
 
 | 领域 | 当前选择 | 说明 |
 | --- | --- | --- |
@@ -18,14 +18,33 @@ SQLite 使用 Node 22 内建的 `node:sqlite`。该 Node API 目前仍有 experi
 
 ## 2. 数据所有权
 
-```mermaid
-flowchart LR
-    U[Telegram 用户] --> TG[Telegram Bot API]
-    TG --> B[SuperToken Bot]
-    B --> D[Bot SQLite 或 PostgreSQL]
-    B -->|HMAC scoped Bridge v1| N[new-api Telegram Bridge]
-    N --> A[new-api 自有数据库]
-    B --> O[运营 Telegram 群]
+```text
+                         authenticated web session
++-----------------+  ------------------------------>  +----------------------+
+| Telegram user   |                                   | new-api console      |
++--------+--------+                                   +----------+-----------+
+         | Telegram update                                       |
+         v                                                       | stores Telegram ID
++-----------------+   webhook or polling   +-----------------+  v
+| Telegram Bot API|  --------------------> | SuperToken Bot  |-----> [new-api database]
++-----------------+                       +--+-----------+--+
+                                                |           \
+                         Bot-only data          |            \ HMAC + timestamp + nonce
+                                                v             v
+                                      +----------------+  +----------------------+
+                                      | Bot SQLite or  |  | new-api Telegram     |
+                                      | PostgreSQL     |  | Bridge v1            |
+                                      +----------------+  +----------+-----------+
+                                                |                        |
+                                                v                        v
+                                      [notifications, updates,       [account, quota,
+                                       support routing, audit]        keys, orders]
+
+[Epay provider] -- signed payment callback --> [new-api payment handler] --> [new-api database]
+
+Notes:
+- The Bot never receives user passwords, PATs, full API keys, payment credentials, or ledger data.
+- Telegram top-up is disabled by default. On-chain USDT/USDC is mock-only and has no production path.
 ```
 
 | 数据类别 | 权威系统 | Bot 的边界 |
@@ -43,24 +62,25 @@ Node 只通过 HTTP 调用 `new-api`。默认 `admin` 模式以网页 Telegram �
 
 ## 3. 绑定与查询流程
 
-```mermaid
-sequenceDiagram
-    participant U as Telegram 用户
-    participant B as SuperToken Bot
-    participant N as new-api Bridge
-    participant D as Bot DB
+```text
+Telegram user          SuperToken Bot      new-api console + Bridge       Bot DB
+     |                       |                     |                        |
+     | web session bind -------------------------> |                        |
+     |                       |                     | store Telegram ID      |
+     | /bind                 |                     |                   |
+     | --------------------> | account/summary     |                   |
+     |                       | -- HMAC ----------> |                   |
+     |                       | <--- minimum DTO -- |                   |
+     |                       | save verified link --------------------> |
+     | <--- bind confirmed - |                     |                   |
+     |                       |                     |                   |
+     | /account or /usage    |                     |                   |
+     | --------------------> | read summary/usage  |                   |
+     |                       | -- HMAC ----------> |                   |
+     |                       | <--- current DTO -- |                   |
+     | <--- formatted reply- |                     |                   |
 
-    U->>N: 在网页完成 Telegram 绑定
-    U->>B: /bind
-    B->>N: account/summary（telegram_id + HMAC）
-    N-->>B: 最小账户摘要
-    B->>D: 保存 Telegram ID 与 new-api 用户 ID 映射
-    B-->>U: 绑定成功
-
-    U->>B: /account 或 /usage
-    B->>N: 只读摘要/统计请求
-    N-->>B: 当次结果
-    B-->>U: 格式化展示
+The Bot stores only the verified link and operational idempotency state. It does not cache balances or usage.
 ```
 
 账户、用量与订阅数据只在一次请求处理期间存在于内存中。通知任务也是每轮重新从 `new-api` 读取状态；数据库只保存“这个通知是否已经发过”的幂等键，不保存余额或消费数值。
@@ -74,10 +94,15 @@ sequenceDiagram
 | `notification_preferences` | 阈值、暂停状态 | 用户通知选择 |
 | `notification_events` | 幂等键、事件类型 | 防止重复通知 |
 | `support_tickets` | 工单号、用户 chat ID、运营消息 ID、状态 | 客服回复路由，不含正文 |
+| `telegram_update_queue` | Update ID、临时 payload、处理状态 | Webhook 持久化、短时重试与崩溃恢复；完成/失败后清空 payload |
+| `broadcasts` | 管理员、公告快照、状态、总数与结果计数 | 广播草稿、确认、暂停、恢复、取消与状态展示 |
+| `broadcast_deliveries` | 广播 ID、收件人 chat ID、投递状态、重试与租约 | 持久化收件人快照和后台限速投递；不保存消息接收方以外的用户内容 |
 | `processed_updates` | Telegram `update_id` | Update 幂等 |
 | `audit_logs` | 动作、目标、阈值/广播计数 | Bot 操作审计，不含外部响应 |
 
-`processed_updates`、通知事件、关闭工单与审计日志尚未实现保留期清理，这是前期 SQLite 部署前必须补齐的运维项；不能以“数据量小”当作无限增长的理由。
+`telegram_update_queue` 的原始 payload 在完成或最终失败后立即清空。`processed_updates`、队列状态、通知事件、关闭工单与审计日志尚未实现保留期清理，这是前期 SQLite 部署前必须补齐的运维项；不能以“数据量小”当作无限增长的理由。
+
+广播确认只把任务放入 Bot 自有数据库，后台 Worker 才调用 Telegram 发送接口。已完成的收件任务不会再次被领取；但 Telegram API 不支持投递幂等键，因此进程在 Telegram 接收消息和 Bot 数据库写入完成之间崩溃时，租约恢复可能重发一次。这是明确接受的至少一次语义，管理员状态页只能展示已确认成功、最终失败和未完成数，不能承诺严格一次。
 
 ## 5. 安全边界
 

@@ -86,7 +86,7 @@ async function checkLowQuota(
   const threshold = preferenceThreshold ?? deps.config.notificationDefaultLowQuotaThreshold;
   if (threshold === undefined) return;
   const eventKey = `low-quota:${account.id}:${threshold}`;
-  const remaining = account.quota - account.usedQuota;
+  const remaining = account.quota;
   if (remaining > threshold) {
     await deps.repository.clearNotificationEvent(eventKey);
     return;
@@ -98,8 +98,8 @@ async function checkLowQuota(
       deps.bot.api,
       chatId,
       locale === 'en'
-        ? `Balance alert\nRemaining quota: ${formatQuota(remaining, status)}\nThreshold: ${formatQuota(threshold, status)}`
-        : `余额提醒\n剩余额度：${formatQuota(remaining, status)}\n当前阈值：${formatQuota(threshold, status)}`,
+        ? `Balance alert\nCurrent balance: ${formatQuota(remaining, status)}\nThreshold: ${formatQuota(threshold, status)}`
+        : `余额提醒\n当前余额：${formatQuota(remaining, status)}\n当前阈值：${formatQuota(threshold, status)}`,
     );
   } catch (error) {
     await deps.repository.clearNotificationEvent(eventKey);

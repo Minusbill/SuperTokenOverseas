@@ -26,6 +26,7 @@ const envSchema = z.object({
   NEW_API_PRICING_URL: optionalUrl,
   NEW_API_DOCS_URL: optionalUrl,
   NEW_API_TOPUP_URL: optionalUrl,
+  TELEGRAM_TOPUP_MODE: z.enum(['disabled', 'mock', 'live']).optional(),
   NEW_API_ADMIN_PAT: optionalEnvString.pipe(z.string().min(1).optional()),
   NEW_API_INTEGRATION_SECRET: optionalSecret,
   NEW_API_REQUEST_TIMEOUT_MS: z.coerce.number().int().min(500).max(30000).default(4000),
@@ -51,6 +52,7 @@ export type Config = {
   newApiPricingUrl: string;
   newApiDocsUrl?: string;
   newApiTopupUrl: string;
+  telegramTopUpMode: 'disabled' | 'mock' | 'live';
   newApiAdminPat?: string;
   newApiIntegrationSecret?: string;
   newApiRequestTimeoutMs: number;
@@ -77,6 +79,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (parsed.NODE_ENV === 'production' && !parsed.DATABASE_URL) {
     throw new Error('DATABASE_URL is required in production');
   }
+  if (parsed.NODE_ENV === 'production' && parsed.BOT_MODE === 'webhook'
+    && parsed.TELEGRAM_WEBHOOK_SECRET === 'development-webhook-secret') {
+    throw new Error('TELEGRAM_WEBHOOK_SECRET must be explicitly configured in production webhook mode');
+  }
 
   const adminIds = new Set(
     parsed.BOT_ADMIN_TELEGRAM_IDS.split(',')
@@ -99,6 +105,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     newApiPricingUrl: (parsed.NEW_API_PRICING_URL ?? `${newApiPortalUrl}/pricing`).replace(/\/$/, ''),
     ...(parsed.NEW_API_DOCS_URL ? { newApiDocsUrl: parsed.NEW_API_DOCS_URL.replace(/\/$/, '') } : {}),
     newApiTopupUrl: (parsed.NEW_API_TOPUP_URL ?? newApiPortalUrl).replace(/\/$/, ''),
+    telegramTopUpMode: parsed.TELEGRAM_TOPUP_MODE ?? (parsed.NODE_ENV === 'production' ? 'disabled' : 'mock'),
     ...(parsed.NEW_API_ADMIN_PAT ? { newApiAdminPat: parsed.NEW_API_ADMIN_PAT } : {}),
     ...(parsed.NEW_API_INTEGRATION_SECRET
       ? { newApiIntegrationSecret: parsed.NEW_API_INTEGRATION_SECRET }

@@ -56,6 +56,50 @@ CREATE TABLE IF NOT EXISTS processed_updates (
   received_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE IF NOT EXISTS telegram_update_queue (
+  update_id INTEGER PRIMARY KEY,
+  payload TEXT,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'completed', 'failed')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  available_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  lease_expires_at TEXT,
+  created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  completed_at TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_telegram_update_queue_available
+  ON telegram_update_queue (status, available_at, update_id);
+
+CREATE TABLE IF NOT EXISTS broadcasts (
+  id TEXT PRIMARY KEY,
+  admin_telegram_user_id TEXT NOT NULL,
+  message TEXT NOT NULL CHECK (length(message) BETWEEN 1 AND 3500),
+  status TEXT NOT NULL CHECK (status IN ('draft', 'queued', 'running', 'paused', 'completed', 'cancelled')),
+  target_count INTEGER NOT NULL CHECK (target_count >= 0),
+  delivered_count INTEGER NOT NULL DEFAULT 0 CHECK (delivered_count >= 0),
+  failed_count INTEGER NOT NULL DEFAULT 0 CHECK (failed_count >= 0),
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS broadcast_deliveries (
+  broadcast_id TEXT NOT NULL REFERENCES broadcasts(id) ON DELETE CASCADE,
+  telegram_user_id TEXT NOT NULL,
+  chat_id TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued', 'processing', 'delivered', 'failed', 'cancelled')),
+  attempts INTEGER NOT NULL DEFAULT 0 CHECK (attempts >= 0),
+  available_at TEXT NOT NULL,
+  lease_expires_at TEXT,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  PRIMARY KEY (broadcast_id, telegram_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_broadcast_deliveries_available
+  ON broadcast_deliveries (status, available_at, broadcast_id, telegram_user_id);
+
 CREATE TABLE IF NOT EXISTS audit_logs (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   actor_telegram_user_id TEXT,

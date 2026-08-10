@@ -65,6 +65,12 @@ describe('loadConfig', () => {
     );
   });
 
+  it('keeps Telegram checkout in mock mode for tests and disabled by default in production', () => {
+    expect(loadConfig(baseEnv()).telegramTopUpMode).toBe('mock');
+    expect(loadConfig(baseEnv({ NODE_ENV: 'production', DATABASE_URL: 'sqlite:./data/bot.sqlite' })).telegramTopUpMode).toBe('disabled');
+    expect(loadConfig(baseEnv({ TELEGRAM_TOPUP_MODE: 'live' })).telegramTopUpMode).toBe('live');
+  });
+
   it('accepts SQLite as the initial persistent store', () => {
     const config = loadConfig(baseEnv({ DATABASE_URL: 'sqlite:./data/supertoken_bot.sqlite' }));
     expect(config.databaseUrl).toBe('sqlite:./data/supertoken_bot.sqlite');
@@ -80,5 +86,12 @@ describe('loadConfig', () => {
     expect(() => loadConfig(baseEnv({ BOT_MODE: 'webhook' }))).toThrow(
       'PUBLIC_BASE_URL is required when BOT_MODE=webhook',
     );
+  });
+
+  it('rejects the development webhook secret in production', () => {
+    expect(() => loadConfig(baseEnv({
+      NODE_ENV: 'production', BOT_MODE: 'webhook', PUBLIC_BASE_URL: 'https://bot.example.test',
+      DATABASE_URL: 'sqlite:./data/bot.sqlite',
+    }))).toThrow('TELEGRAM_WEBHOOK_SECRET must be explicitly configured');
   });
 });

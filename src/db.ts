@@ -4,14 +4,18 @@ import { createRequire } from 'node:module';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
-import { Pool } from 'pg';
+import { Pool, type PoolClient } from 'pg';
 import type { Logger } from 'pino';
 import type {
   AccountBinding,
   ActiveBinding,
   BotAuditMetadata,
   BotRepository,
+  Broadcast,
+  BroadcastRecipient,
   NotificationPreference,
+  QueuedBroadcastDelivery,
+  QueuedTelegramUpdate,
   RepositoryStats,
   SupportTicket,
   TelegramUser,
@@ -43,6 +47,279 @@ export class PostgresRepository implements BotRepository {
       [updateId],
     );
     return result.rowCount === 1;
+  }
+
+  public async releaseUpdate(updateId: number): Promise<void> {
+    await this.pool.query('DELETE FROM processed_updates WHERE update_id = $1', [updateId]);
+  }
+
+  public async enqueueTelegramUpdate(updateId: number, payload: string): Promise<boolean> {
+    const now = new Date();
+    const result = await this.pool.query(
+      `INSERT INTO telegram_update_queue (update_id, payload, available_at, created_at, updated_at)
+       VALUES ($1, $2, $3, $3, $3)
+       ON CONFLICT (update_id) DO NOTHING`,
+      [updateId, payload, now],
+    );
+    return result.rowCount === 1;
+  }
+
+  public async claimQueuedTelegramUpdate(): Promise<QueuedTelegramUpdate | null> {
+    const result = await this.pool.query(
+      `WITH candidate AS (
+         SELECT update_id
+         FROM telegram_update_queue
+         WHERE (status = 'queued' AND available_at <= NOW())
+            OR (status = 'processing' AND lease_expires_at <= NOW())
+         ORDER BY available_at, update_id
+         FOR UPDATE SKIP LOCKED
+         LIMIT 1
+       )
+       UPDATE telegram_update_queue AS queue
+       SET status = 'processing',
+           attempts = queue.attempts + 1,
+           lease_expires_at = NOW() + INTERVAL '60 seconds',
+           updated_at = NOW()
+       FROM candidate
+       WHERE queue.update_id = candidate.update_id
+       RETURNING queue.update_id, queue.payload, queue.attempts`,
+    );
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    return row ? mapQueuedTelegramUpdate(row) : null;
+  }
+
+  public async completeQueuedTelegramUpdate(updateId: number): Promise<void> {
+    await this.pool.query(
+      `UPDATE telegram_update_queue
+       SET status = 'completed', payload = NULL, lease_expires_at = NULL,
+           completed_at = NOW(), updated_at = NOW()
+       WHERE update_id = $1`,
+      [updateId],
+    );
+  }
+
+  public async retryQueuedTelegramUpdate(
+    updateId: number,
+    retryAt: Date,
+  ): Promise<'queued' | 'failed'> {
+    const result = await this.pool.query(
+      `UPDATE telegram_update_queue
+       SET status = CASE WHEN attempts >= 5 THEN 'failed' ELSE 'queued' END,
+           available_at = CASE WHEN attempts >= 5 THEN available_at ELSE $2 END,
+           payload = CASE WHEN attempts >= 5 THEN NULL ELSE payload END,
+           lease_expires_at = NULL,
+           updated_at = NOW()
+       WHERE update_id = $1
+       RETURNING status`,
+      [updateId, retryAt],
+    );
+    return result.rows[0]?.status === 'failed' ? 'failed' : 'queued';
+  }
+
+  public async createBroadcastDraft(input: {
+    id: string;
+    adminTelegramUserId: string;
+    message: string;
+    recipients: BroadcastRecipient[];
+  }): Promise<Broadcast> {
+    const recipients = uniqueBroadcastRecipients(input.recipients);
+    const now = new Date();
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `INSERT INTO broadcasts
+           (id, admin_telegram_user_id, message, status, target_count, created_at, updated_at)
+         VALUES ($1, $2, $3, 'draft', $4, $5, $5)
+         RETURNING id, admin_telegram_user_id, message, status, target_count, delivered_count,
+                   failed_count, created_at, updated_at, completed_at`,
+        [input.id, input.adminTelegramUserId, input.message, recipients.length, now],
+      );
+      if (recipients.length > 0) {
+        await client.query(
+          `INSERT INTO broadcast_deliveries
+             (broadcast_id, telegram_user_id, chat_id, status, attempts, available_at, updated_at)
+           SELECT $1, recipient.telegram_user_id, recipient.chat_id, 'queued', 0, $4, $4
+           FROM UNNEST($2::text[], $3::text[]) AS recipient(telegram_user_id, chat_id)`,
+          [input.id, recipients.map((recipient) => recipient.telegramUserId), recipients.map((recipient) => recipient.chatId), now],
+        );
+      }
+      await client.query('COMMIT');
+      return mapBroadcast(result.rows[0] as Record<string, unknown>);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  public async getBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const result = await this.pool.query(
+      `SELECT id, admin_telegram_user_id, message, status, target_count, delivered_count,
+              failed_count, created_at, updated_at, completed_at
+       FROM broadcasts WHERE id = $1 AND admin_telegram_user_id = $2`,
+      [broadcastId, adminTelegramUserId],
+    );
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    return row ? mapBroadcast(row) : null;
+  }
+
+  public async queueBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const result = await this.pool.query(
+      `UPDATE broadcasts
+       SET status = CASE WHEN target_count = 0 THEN 'completed' ELSE 'queued' END,
+           updated_at = NOW(),
+           completed_at = CASE WHEN target_count = 0 THEN NOW() ELSE NULL END
+       WHERE id = $1 AND admin_telegram_user_id = $2 AND status = 'draft'
+       RETURNING id, admin_telegram_user_id, message, status, target_count, delivered_count,
+                 failed_count, created_at, updated_at, completed_at`,
+      [broadcastId, adminTelegramUserId],
+    );
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    return row ? mapBroadcast(row) : null;
+  }
+
+  public async pauseBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    return this.updateBroadcastStatus(broadcastId, adminTelegramUserId, ['queued', 'running'], 'paused');
+  }
+
+  public async resumeBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    return this.updateBroadcastStatus(broadcastId, adminTelegramUserId, ['paused'], 'queued');
+  }
+
+  public async cancelBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `UPDATE broadcasts
+         SET status = 'cancelled', updated_at = NOW()
+         WHERE id = $1 AND admin_telegram_user_id = $2
+           AND status IN ('draft', 'queued', 'running', 'paused')
+         RETURNING id, admin_telegram_user_id, message, status, target_count, delivered_count,
+                   failed_count, created_at, updated_at, completed_at`,
+        [broadcastId, adminTelegramUserId],
+      );
+      const row = result.rows[0] as Record<string, unknown> | undefined;
+      if (!row) {
+        await client.query('COMMIT');
+        return null;
+      }
+      await client.query(
+        `UPDATE broadcast_deliveries
+         SET status = 'cancelled', lease_expires_at = NULL, updated_at = NOW()
+         WHERE broadcast_id = $1 AND status = 'queued'`,
+        [broadcastId],
+      );
+      await client.query('COMMIT');
+      return mapBroadcast(row);
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  public async claimBroadcastDelivery(): Promise<QueuedBroadcastDelivery | null> {
+    const result = await this.pool.query(
+      `WITH candidate AS (
+         SELECT delivery.broadcast_id, delivery.telegram_user_id
+         FROM broadcast_deliveries AS delivery
+         JOIN broadcasts AS broadcast ON broadcast.id = delivery.broadcast_id
+         WHERE broadcast.status IN ('queued', 'running')
+           AND ((delivery.status = 'queued' AND delivery.available_at <= NOW())
+             OR (delivery.status = 'processing' AND delivery.lease_expires_at <= NOW()))
+         ORDER BY broadcast.created_at, delivery.available_at, delivery.telegram_user_id
+         FOR UPDATE OF delivery, broadcast SKIP LOCKED
+         LIMIT 1
+       ), claimed AS (
+         UPDATE broadcast_deliveries AS delivery
+         SET status = 'processing', attempts = delivery.attempts + 1,
+             lease_expires_at = NOW() + INTERVAL '60 seconds', updated_at = NOW()
+         FROM candidate
+         WHERE delivery.broadcast_id = candidate.broadcast_id
+           AND delivery.telegram_user_id = candidate.telegram_user_id
+         RETURNING delivery.broadcast_id, delivery.telegram_user_id, delivery.chat_id, delivery.attempts
+       ), running AS (
+         UPDATE broadcasts AS broadcast
+         SET status = 'running', updated_at = NOW()
+         FROM claimed
+         WHERE broadcast.id = claimed.broadcast_id AND broadcast.status = 'queued'
+       )
+       SELECT claimed.broadcast_id, claimed.telegram_user_id, claimed.chat_id, claimed.attempts, broadcast.message
+       FROM claimed JOIN broadcasts AS broadcast ON broadcast.id = claimed.broadcast_id`,
+    );
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    return row ? mapQueuedBroadcastDelivery(row) : null;
+  }
+
+  public async completeBroadcastDelivery(broadcastId: string, telegramUserId: string): Promise<void> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `UPDATE broadcast_deliveries
+         SET status = 'delivered', lease_expires_at = NULL, completed_at = NOW(), updated_at = NOW()
+         WHERE broadcast_id = $1 AND telegram_user_id = $2 AND status = 'processing'`,
+        [broadcastId, telegramUserId],
+      );
+      await refreshPostgresBroadcast(client, broadcastId);
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  public async retryBroadcastDelivery(
+    broadcastId: string,
+    telegramUserId: string,
+    retryAt: Date,
+  ): Promise<'queued' | 'failed' | 'cancelled'> {
+    const client = await this.pool.connect();
+    try {
+      await client.query('BEGIN');
+      const result = await client.query(
+        `SELECT delivery.attempts, broadcast.status
+         FROM broadcast_deliveries AS delivery
+         JOIN broadcasts AS broadcast ON broadcast.id = delivery.broadcast_id
+         WHERE delivery.broadcast_id = $1 AND delivery.telegram_user_id = $2
+         FOR UPDATE`,
+        [broadcastId, telegramUserId],
+      );
+      const row = result.rows[0] as Record<string, unknown> | undefined;
+      if (!row || row.status === 'cancelled') {
+        await client.query(
+          `UPDATE broadcast_deliveries
+           SET status = 'cancelled', lease_expires_at = NULL, updated_at = NOW()
+           WHERE broadcast_id = $1 AND telegram_user_id = $2 AND status = 'processing'`,
+          [broadcastId, telegramUserId],
+        );
+        await client.query('COMMIT');
+        return 'cancelled';
+      }
+      const failed = Number(row.attempts) >= 5;
+      await client.query(
+        `UPDATE broadcast_deliveries
+         SET status = $3, available_at = CASE WHEN $4 THEN available_at ELSE $5 END,
+             lease_expires_at = NULL, completed_at = CASE WHEN $4 THEN NOW() ELSE NULL END,
+             updated_at = NOW()
+         WHERE broadcast_id = $1 AND telegram_user_id = $2 AND status = 'processing'`,
+        [broadcastId, telegramUserId, failed ? 'failed' : 'queued', failed, retryAt],
+      );
+      await refreshPostgresBroadcast(client, broadcastId);
+      await client.query('COMMIT');
+      return failed ? 'failed' : 'queued';
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
   }
 
   public async upsertTelegramUser(user: TelegramUser): Promise<TelegramUser> {
@@ -262,6 +539,50 @@ export class PostgresRepository implements BotRepository {
       ],
     );
   }
+
+  private async updateBroadcastStatus(
+    broadcastId: string,
+    adminTelegramUserId: string,
+    from: Broadcast['status'][],
+    to: Broadcast['status'],
+  ): Promise<Broadcast | null> {
+    const result = await this.pool.query(
+      `UPDATE broadcasts
+       SET status = $3, updated_at = NOW()
+       WHERE id = $1 AND admin_telegram_user_id = $2 AND status = ANY($4::text[])
+       RETURNING id, admin_telegram_user_id, message, status, target_count, delivered_count,
+                 failed_count, created_at, updated_at, completed_at`,
+      [broadcastId, adminTelegramUserId, to, from],
+    );
+    const row = result.rows[0] as Record<string, unknown> | undefined;
+    return row ? mapBroadcast(row) : null;
+  }
+}
+
+async function refreshPostgresBroadcast(client: PoolClient, broadcastId: string): Promise<void> {
+  await client.query(
+    `UPDATE broadcasts AS broadcast
+     SET delivered_count = counts.delivered_count,
+         failed_count = counts.failed_count,
+         updated_at = NOW(),
+         status = CASE
+           WHEN broadcast.status IN ('queued', 'running') AND counts.remaining_count = 0 THEN 'completed'
+           ELSE broadcast.status
+         END,
+         completed_at = CASE
+           WHEN broadcast.status IN ('queued', 'running') AND counts.remaining_count = 0 THEN NOW()
+           ELSE broadcast.completed_at
+         END
+     FROM (
+       SELECT
+         COUNT(*) FILTER (WHERE status = 'delivered')::integer AS delivered_count,
+         COUNT(*) FILTER (WHERE status = 'failed')::integer AS failed_count,
+         COUNT(*) FILTER (WHERE status IN ('queued', 'processing'))::integer AS remaining_count
+       FROM broadcast_deliveries WHERE broadcast_id = $1
+     ) AS counts
+     WHERE broadcast.id = $1`,
+    [broadcastId],
+  );
 }
 
 type SqliteRow = Record<string, unknown>;
@@ -298,6 +619,293 @@ export class SqliteRepository implements BotRepository {
       'INSERT INTO processed_updates (update_id) VALUES (?) ON CONFLICT (update_id) DO NOTHING',
     ).run(updateId);
     return Number(result.changes) === 1;
+  }
+
+  public async releaseUpdate(updateId: number): Promise<void> {
+    this.db.prepare('DELETE FROM processed_updates WHERE update_id = ?').run(updateId);
+  }
+
+  public async enqueueTelegramUpdate(updateId: number, payload: string): Promise<boolean> {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(
+      `INSERT INTO telegram_update_queue (update_id, payload, available_at, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?) ON CONFLICT (update_id) DO NOTHING`,
+    ).run(updateId, payload, now, now, now);
+    return Number(result.changes) === 1;
+  }
+
+  public async claimQueuedTelegramUpdate(): Promise<QueuedTelegramUpdate | null> {
+    const now = new Date();
+    const nowText = now.toISOString();
+    const leaseExpiresAt = new Date(now.getTime() + 60_000).toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(
+        `SELECT update_id, payload, attempts
+         FROM telegram_update_queue
+         WHERE (status = 'queued' AND available_at <= ?)
+            OR (status = 'processing' AND lease_expires_at <= ?)
+         ORDER BY available_at, update_id
+         LIMIT 1`,
+      ).get(nowText, nowText) as SqliteRow | undefined;
+      if (!row) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      this.db.prepare(
+        `UPDATE telegram_update_queue
+         SET status = 'processing', attempts = attempts + 1,
+             lease_expires_at = ?, updated_at = ?
+         WHERE update_id = ?`,
+      ).run(leaseExpiresAt, nowText, Number(row.update_id));
+      this.db.exec('COMMIT');
+      return {
+        updateId: Number(row.update_id),
+        payload: String(row.payload),
+        attempts: Number(row.attempts) + 1,
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public async completeQueuedTelegramUpdate(updateId: number): Promise<void> {
+    const now = new Date().toISOString();
+    this.db.prepare(
+      `UPDATE telegram_update_queue
+       SET status = 'completed', payload = NULL, lease_expires_at = NULL,
+           completed_at = ?, updated_at = ?
+       WHERE update_id = ?`,
+    ).run(now, now, updateId);
+  }
+
+  public async retryQueuedTelegramUpdate(
+    updateId: number,
+    retryAt: Date,
+  ): Promise<'queued' | 'failed'> {
+    const row = this.db.prepare(
+      `SELECT attempts FROM telegram_update_queue WHERE update_id = ?`,
+    ).get(updateId) as SqliteRow | undefined;
+    const failed = Number(row?.attempts ?? 0) >= 5;
+    this.db.prepare(
+      `UPDATE telegram_update_queue
+       SET status = ?, available_at = CASE WHEN ? THEN available_at ELSE ? END,
+           payload = CASE WHEN ? THEN NULL ELSE payload END,
+           lease_expires_at = NULL, updated_at = ?
+       WHERE update_id = ?`,
+    ).run(
+      failed ? 'failed' : 'queued',
+      failed ? 1 : 0,
+      retryAt.toISOString(),
+      failed ? 1 : 0,
+      new Date().toISOString(),
+      updateId,
+    );
+    return failed ? 'failed' : 'queued';
+  }
+
+  public async createBroadcastDraft(input: {
+    id: string;
+    adminTelegramUserId: string;
+    message: string;
+    recipients: BroadcastRecipient[];
+  }): Promise<Broadcast> {
+    const recipients = uniqueBroadcastRecipients(input.recipients);
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(
+        `INSERT INTO broadcasts
+           (id, admin_telegram_user_id, message, status, target_count, created_at, updated_at)
+         VALUES (?, ?, ?, 'draft', ?, ?, ?)`,
+      ).run(input.id, input.adminTelegramUserId, input.message, recipients.length, now, now);
+      const insertDelivery = this.db.prepare(
+        `INSERT INTO broadcast_deliveries
+           (broadcast_id, telegram_user_id, chat_id, status, attempts, available_at, updated_at)
+         VALUES (?, ?, ?, 'queued', 0, ?, ?)`,
+      );
+      for (const recipient of recipients) {
+        insertDelivery.run(input.id, recipient.telegramUserId, recipient.chatId, now, now);
+      }
+      const row = this.db.prepare(
+        `SELECT id, admin_telegram_user_id, message, status, target_count, delivered_count,
+                failed_count, created_at, updated_at, completed_at
+         FROM broadcasts WHERE id = ?`,
+      ).get(input.id) as SqliteRow | undefined;
+      this.db.exec('COMMIT');
+      if (!row) throw new Error('SQLite broadcast draft was not persisted');
+      return mapBroadcast(row);
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public async getBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const row = this.db.prepare(
+      `SELECT id, admin_telegram_user_id, message, status, target_count, delivered_count,
+              failed_count, created_at, updated_at, completed_at
+       FROM broadcasts WHERE id = ? AND admin_telegram_user_id = ?`,
+    ).get(broadcastId, adminTelegramUserId) as SqliteRow | undefined;
+    return row ? mapBroadcast(row) : null;
+  }
+
+  public async queueBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const now = new Date().toISOString();
+    const result = this.db.prepare(
+      `UPDATE broadcasts
+       SET status = CASE WHEN target_count = 0 THEN 'completed' ELSE 'queued' END,
+           updated_at = ?, completed_at = CASE WHEN target_count = 0 THEN ? ELSE NULL END
+       WHERE id = ? AND admin_telegram_user_id = ? AND status = 'draft'`,
+    ).run(now, now, broadcastId, adminTelegramUserId);
+    if (Number(result.changes) !== 1) return null;
+    return this.getBroadcast(broadcastId, adminTelegramUserId);
+  }
+
+  public async pauseBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    return this.updateBroadcastStatus(broadcastId, adminTelegramUserId, ['queued', 'running'], 'paused');
+  }
+
+  public async resumeBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    return this.updateBroadcastStatus(broadcastId, adminTelegramUserId, ['paused'], 'queued');
+  }
+
+  public async cancelBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const result = this.db.prepare(
+        `UPDATE broadcasts
+         SET status = 'cancelled', updated_at = ?
+         WHERE id = ? AND admin_telegram_user_id = ?
+           AND status IN ('draft', 'queued', 'running', 'paused')`,
+      ).run(now, broadcastId, adminTelegramUserId);
+      if (Number(result.changes) !== 1) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      this.db.prepare(
+        `UPDATE broadcast_deliveries
+         SET status = 'cancelled', lease_expires_at = NULL, updated_at = ?
+         WHERE broadcast_id = ? AND status = 'queued'`,
+      ).run(now, broadcastId);
+      const row = this.db.prepare(
+        `SELECT id, admin_telegram_user_id, message, status, target_count, delivered_count,
+                failed_count, created_at, updated_at, completed_at
+         FROM broadcasts WHERE id = ?`,
+      ).get(broadcastId) as SqliteRow | undefined;
+      this.db.exec('COMMIT');
+      return row ? mapBroadcast(row) : null;
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public async claimBroadcastDelivery(): Promise<QueuedBroadcastDelivery | null> {
+    const now = new Date();
+    const nowText = now.toISOString();
+    const leaseExpiresAt = new Date(now.getTime() + 60_000).toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(
+        `SELECT delivery.broadcast_id, delivery.telegram_user_id, delivery.chat_id,
+                delivery.attempts, broadcast.message
+         FROM broadcast_deliveries AS delivery
+         JOIN broadcasts AS broadcast ON broadcast.id = delivery.broadcast_id
+         WHERE broadcast.status IN ('queued', 'running')
+           AND ((delivery.status = 'queued' AND delivery.available_at <= ?)
+             OR (delivery.status = 'processing' AND delivery.lease_expires_at <= ?))
+         ORDER BY broadcast.created_at, delivery.available_at, delivery.telegram_user_id
+         LIMIT 1`,
+      ).get(nowText, nowText) as SqliteRow | undefined;
+      if (!row) {
+        this.db.exec('COMMIT');
+        return null;
+      }
+      this.db.prepare(
+        `UPDATE broadcast_deliveries
+         SET status = 'processing', attempts = attempts + 1,
+             lease_expires_at = ?, updated_at = ?
+         WHERE broadcast_id = ? AND telegram_user_id = ?`,
+      ).run(leaseExpiresAt, nowText, String(row.broadcast_id), String(row.telegram_user_id));
+      this.db.prepare(
+        `UPDATE broadcasts SET status = 'running', updated_at = ?
+         WHERE id = ? AND status = 'queued'`,
+      ).run(nowText, String(row.broadcast_id));
+      this.db.exec('COMMIT');
+      return {
+        broadcastId: String(row.broadcast_id),
+        telegramUserId: String(row.telegram_user_id),
+        chatId: String(row.chat_id),
+        message: String(row.message),
+        attempts: Number(row.attempts) + 1,
+      };
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public async completeBroadcastDelivery(broadcastId: string, telegramUserId: string): Promise<void> {
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare(
+        `UPDATE broadcast_deliveries
+         SET status = 'delivered', lease_expires_at = NULL, completed_at = ?, updated_at = ?
+         WHERE broadcast_id = ? AND telegram_user_id = ? AND status = 'processing'`,
+      ).run(now, now, broadcastId, telegramUserId);
+      this.refreshBroadcast(broadcastId, now);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  public async retryBroadcastDelivery(
+    broadcastId: string,
+    telegramUserId: string,
+    retryAt: Date,
+  ): Promise<'queued' | 'failed' | 'cancelled'> {
+    const now = new Date().toISOString();
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      const row = this.db.prepare(
+        `SELECT delivery.attempts, broadcast.status
+         FROM broadcast_deliveries AS delivery
+         JOIN broadcasts AS broadcast ON broadcast.id = delivery.broadcast_id
+         WHERE delivery.broadcast_id = ? AND delivery.telegram_user_id = ?`,
+      ).get(broadcastId, telegramUserId) as SqliteRow | undefined;
+      if (!row || row.status === 'cancelled') {
+        this.db.prepare(
+          `UPDATE broadcast_deliveries
+           SET status = 'cancelled', lease_expires_at = NULL, updated_at = ?
+           WHERE broadcast_id = ? AND telegram_user_id = ? AND status = 'processing'`,
+        ).run(now, broadcastId, telegramUserId);
+        this.db.exec('COMMIT');
+        return 'cancelled';
+      }
+      const failed = Number(row.attempts) >= 5;
+      this.db.prepare(
+        `UPDATE broadcast_deliveries
+         SET status = ?, available_at = CASE WHEN ? THEN available_at ELSE ? END,
+             lease_expires_at = NULL, completed_at = CASE WHEN ? THEN ? ELSE NULL END,
+             updated_at = ?
+         WHERE broadcast_id = ? AND telegram_user_id = ? AND status = 'processing'`,
+      ).run(
+        failed ? 'failed' : 'queued', failed ? 1 : 0, retryAt.toISOString(), failed ? 1 : 0,
+        now, now, broadcastId, telegramUserId,
+      );
+      this.refreshBroadcast(broadcastId, now);
+      this.db.exec('COMMIT');
+      return failed ? 'failed' : 'queued';
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
   }
 
   public async upsertTelegramUser(user: TelegramUser): Promise<TelegramUser> {
@@ -531,12 +1139,65 @@ export class SqliteRepository implements BotRepository {
     const row = this.db.prepare(sql).get() as SqliteRow | undefined;
     return Number(row?.count ?? 0);
   }
+
+  private async updateBroadcastStatus(
+    broadcastId: string,
+    adminTelegramUserId: string,
+    from: Broadcast['status'][],
+    to: Broadcast['status'],
+  ): Promise<Broadcast | null> {
+    if (from.length === 0) return null;
+    const placeholders = from.map(() => '?').join(', ');
+    const result = this.db.prepare(
+      `UPDATE broadcasts SET status = ?, updated_at = ?
+       WHERE id = ? AND admin_telegram_user_id = ? AND status IN (${placeholders})`,
+    ).run(to, new Date().toISOString(), broadcastId, adminTelegramUserId, ...from);
+    if (Number(result.changes) !== 1) return null;
+    return this.getBroadcast(broadcastId, adminTelegramUserId);
+  }
+
+  private refreshBroadcast(broadcastId: string, now: string): void {
+    const counts = this.db.prepare(
+      `SELECT
+         SUM(CASE WHEN status = 'delivered' THEN 1 ELSE 0 END) AS delivered_count,
+         SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count,
+         SUM(CASE WHEN status IN ('queued', 'processing') THEN 1 ELSE 0 END) AS remaining_count
+       FROM broadcast_deliveries WHERE broadcast_id = ?`,
+    ).get(broadcastId) as SqliteRow | undefined;
+    const delivered = Number(counts?.delivered_count ?? 0);
+    const failed = Number(counts?.failed_count ?? 0);
+    const remaining = Number(counts?.remaining_count ?? 0);
+    this.db.prepare(
+      `UPDATE broadcasts
+       SET delivered_count = ?, failed_count = ?, updated_at = ?,
+           status = CASE WHEN status IN ('queued', 'running') AND ? = 0 THEN 'completed' ELSE status END,
+           completed_at = CASE WHEN status IN ('queued', 'running') AND ? = 0 THEN ? ELSE completed_at END
+       WHERE id = ?`,
+    ).run(delivered, failed, now, remaining, remaining, now, broadcastId);
+  }
 }
 
 export class MemoryRepository implements BotRepository {
   private readonly users = new Map<string, TelegramUser>();
   private readonly bindings = new Map<string, AccountBinding>();
   private readonly updates = new Set<number>();
+  private readonly queuedUpdates = new Map<number, {
+    payload: string;
+    status: 'queued' | 'processing' | 'completed' | 'failed';
+    attempts: number;
+    availableAt: number;
+    leaseExpiresAt?: number;
+  }>();
+  private readonly broadcasts = new Map<string, Broadcast>();
+  private readonly broadcastDeliveries = new Map<string, {
+    broadcastId: string;
+    telegramUserId: string;
+    chatId: string;
+    status: 'queued' | 'processing' | 'delivered' | 'failed' | 'cancelled';
+    attempts: number;
+    availableAt: number;
+    leaseExpiresAt?: number;
+  }>();
   private readonly notificationPreferences = new Map<string, NotificationPreference>();
   private readonly notificationEvents = new Set<string>();
   private readonly tickets = new Map<string, SupportTicket>();
@@ -551,6 +1212,190 @@ export class MemoryRepository implements BotRepository {
     if (this.updates.has(updateId)) return false;
     this.updates.add(updateId);
     return true;
+  }
+
+  public async releaseUpdate(updateId: number): Promise<void> {
+    this.updates.delete(updateId);
+  }
+
+  public async enqueueTelegramUpdate(updateId: number, payload: string): Promise<boolean> {
+    if (this.queuedUpdates.has(updateId)) return false;
+    this.queuedUpdates.set(updateId, {
+      payload,
+      status: 'queued',
+      attempts: 0,
+      availableAt: Date.now(),
+    });
+    return true;
+  }
+
+  public async claimQueuedTelegramUpdate(): Promise<QueuedTelegramUpdate | null> {
+    const now = Date.now();
+    for (const [updateId, queued] of this.queuedUpdates) {
+      const available = queued.status === 'queued' && queued.availableAt <= now;
+      const leaseExpired = queued.status === 'processing' && (queued.leaseExpiresAt ?? 0) <= now;
+      if (!available && !leaseExpired) continue;
+      queued.status = 'processing';
+      queued.attempts += 1;
+      queued.leaseExpiresAt = now + 60_000;
+      return { updateId, payload: queued.payload, attempts: queued.attempts };
+    }
+    return null;
+  }
+
+  public async completeQueuedTelegramUpdate(updateId: number): Promise<void> {
+    const queued = this.queuedUpdates.get(updateId);
+    if (!queued) return;
+    queued.status = 'completed';
+    queued.payload = '';
+    delete queued.leaseExpiresAt;
+  }
+
+  public async retryQueuedTelegramUpdate(
+    updateId: number,
+    retryAt: Date,
+  ): Promise<'queued' | 'failed'> {
+    const queued = this.queuedUpdates.get(updateId);
+    if (!queued) return 'failed';
+    delete queued.leaseExpiresAt;
+    if (queued.attempts >= 5) {
+      queued.status = 'failed';
+      queued.payload = '';
+      return 'failed';
+    }
+    queued.status = 'queued';
+    queued.availableAt = retryAt.getTime();
+    return 'queued';
+  }
+
+  public async createBroadcastDraft(input: {
+    id: string;
+    adminTelegramUserId: string;
+    message: string;
+    recipients: BroadcastRecipient[];
+  }): Promise<Broadcast> {
+    const recipients = uniqueBroadcastRecipients(input.recipients);
+    const now = new Date();
+    const broadcast: Broadcast = {
+      id: input.id,
+      adminTelegramUserId: input.adminTelegramUserId,
+      message: input.message,
+      status: 'draft',
+      targetCount: recipients.length,
+      delivered: 0,
+      failed: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.broadcasts.set(broadcast.id, broadcast);
+    for (const recipient of recipients) {
+      this.broadcastDeliveries.set(this.broadcastDeliveryKey(broadcast.id, recipient.telegramUserId), {
+        broadcastId: broadcast.id,
+        telegramUserId: recipient.telegramUserId,
+        chatId: recipient.chatId,
+        status: 'queued',
+        attempts: 0,
+        availableAt: now.getTime(),
+      });
+    }
+    return { ...broadcast };
+  }
+
+  public async getBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const broadcast = this.broadcasts.get(broadcastId);
+    if (!broadcast || broadcast.adminTelegramUserId !== adminTelegramUserId) return null;
+    return { ...broadcast };
+  }
+
+  public async queueBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const broadcast = this.broadcasts.get(broadcastId);
+    if (!broadcast || broadcast.adminTelegramUserId !== adminTelegramUserId || broadcast.status !== 'draft') return null;
+    const now = new Date();
+    const updated: Broadcast = broadcast.targetCount === 0
+      ? { ...broadcast, status: 'completed', updatedAt: now, completedAt: now }
+      : { ...broadcast, status: 'queued', updatedAt: now };
+    this.broadcasts.set(broadcastId, updated);
+    return { ...updated };
+  }
+
+  public async pauseBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    return this.updateMemoryBroadcastStatus(broadcastId, adminTelegramUserId, ['queued', 'running'], 'paused');
+  }
+
+  public async resumeBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    return this.updateMemoryBroadcastStatus(broadcastId, adminTelegramUserId, ['paused'], 'queued');
+  }
+
+  public async cancelBroadcast(broadcastId: string, adminTelegramUserId: string): Promise<Broadcast | null> {
+    const broadcast = this.broadcasts.get(broadcastId);
+    if (!broadcast || broadcast.adminTelegramUserId !== adminTelegramUserId
+      || !['draft', 'queued', 'running', 'paused'].includes(broadcast.status)) return null;
+    const updated = { ...broadcast, status: 'cancelled' as const, updatedAt: new Date() };
+    this.broadcasts.set(broadcastId, updated);
+    for (const delivery of this.broadcastDeliveries.values()) {
+      if (delivery.broadcastId !== broadcastId || delivery.status !== 'queued') continue;
+      delivery.status = 'cancelled';
+      delete delivery.leaseExpiresAt;
+    }
+    return { ...updated };
+  }
+
+  public async claimBroadcastDelivery(): Promise<QueuedBroadcastDelivery | null> {
+    const now = Date.now();
+    for (const delivery of this.broadcastDeliveries.values()) {
+      const broadcast = this.broadcasts.get(delivery.broadcastId);
+      if (!broadcast || !['queued', 'running'].includes(broadcast.status)) continue;
+      const available = delivery.status === 'queued' && delivery.availableAt <= now;
+      const leaseExpired = delivery.status === 'processing' && (delivery.leaseExpiresAt ?? 0) <= now;
+      if (!available && !leaseExpired) continue;
+      delivery.status = 'processing';
+      delivery.attempts += 1;
+      delivery.leaseExpiresAt = now + 60_000;
+      if (broadcast.status === 'queued') this.broadcasts.set(broadcast.id, { ...broadcast, status: 'running', updatedAt: new Date() });
+      return {
+        broadcastId: delivery.broadcastId,
+        telegramUserId: delivery.telegramUserId,
+        chatId: delivery.chatId,
+        message: broadcast.message,
+        attempts: delivery.attempts,
+      };
+    }
+    return null;
+  }
+
+  public async completeBroadcastDelivery(broadcastId: string, telegramUserId: string): Promise<void> {
+    const delivery = this.broadcastDeliveries.get(this.broadcastDeliveryKey(broadcastId, telegramUserId));
+    if (!delivery || delivery.status !== 'processing') return;
+    delivery.status = 'delivered';
+    delete delivery.leaseExpiresAt;
+    this.refreshMemoryBroadcast(broadcastId);
+  }
+
+  public async retryBroadcastDelivery(
+    broadcastId: string,
+    telegramUserId: string,
+    retryAt: Date,
+  ): Promise<'queued' | 'failed' | 'cancelled'> {
+    const delivery = this.broadcastDeliveries.get(this.broadcastDeliveryKey(broadcastId, telegramUserId));
+    const broadcast = this.broadcasts.get(broadcastId);
+    if (!delivery || !broadcast || broadcast.status === 'cancelled') {
+      if (delivery?.status === 'processing') {
+        delivery.status = 'cancelled';
+        delete delivery.leaseExpiresAt;
+      }
+      return 'cancelled';
+    }
+    if (delivery.status !== 'processing') return 'cancelled';
+    delete delivery.leaseExpiresAt;
+    if (delivery.attempts >= 5) {
+      delivery.status = 'failed';
+      this.refreshMemoryBroadcast(broadcastId);
+      return 'failed';
+    }
+    delivery.status = 'queued';
+    delivery.availableAt = retryAt.getTime();
+    this.refreshMemoryBroadcast(broadcastId);
+    return 'queued';
   }
 
   public async upsertTelegramUser(user: TelegramUser): Promise<TelegramUser> {
@@ -658,6 +1503,46 @@ export class MemoryRepository implements BotRepository {
   }): Promise<void> {
     this.audits.push({ ...input, metadata: normalizeAuditMetadata(input.metadata), createdAt: new Date().toISOString() });
   }
+
+  private async updateMemoryBroadcastStatus(
+    broadcastId: string,
+    adminTelegramUserId: string,
+    from: Broadcast['status'][],
+    to: Broadcast['status'],
+  ): Promise<Broadcast | null> {
+    const broadcast = this.broadcasts.get(broadcastId);
+    if (!broadcast || broadcast.adminTelegramUserId !== adminTelegramUserId || !from.includes(broadcast.status)) return null;
+    const updated = { ...broadcast, status: to, updatedAt: new Date() };
+    this.broadcasts.set(broadcastId, updated);
+    return { ...updated };
+  }
+
+  private refreshMemoryBroadcast(broadcastId: string): void {
+    const broadcast = this.broadcasts.get(broadcastId);
+    if (!broadcast) return;
+    let delivered = 0;
+    let failed = 0;
+    let remaining = 0;
+    for (const delivery of this.broadcastDeliveries.values()) {
+      if (delivery.broadcastId !== broadcastId) continue;
+      if (delivery.status === 'delivered') delivered += 1;
+      if (delivery.status === 'failed') failed += 1;
+      if (delivery.status === 'queued' || delivery.status === 'processing') remaining += 1;
+    }
+    const now = new Date();
+    const completed = ['queued', 'running'].includes(broadcast.status) && remaining === 0;
+    this.broadcasts.set(broadcastId, {
+      ...broadcast,
+      delivered,
+      failed,
+      updatedAt: now,
+      ...(completed ? { status: 'completed', completedAt: now } : {}),
+    });
+  }
+
+  private broadcastDeliveryKey(broadcastId: string, telegramUserId: string): string {
+    return `${broadcastId}:${telegramUserId}`;
+  }
 }
 
 function mapSupportTicket(row: Record<string, unknown>): SupportTicket {
@@ -695,6 +1580,52 @@ function mapTelegramUser(row: Record<string, unknown>): TelegramUser {
     ...(displayName ? { displayName } : {}),
     locale: row.locale === 'en' ? 'en' : 'zh',
   };
+}
+
+function mapQueuedTelegramUpdate(row: Record<string, unknown>): QueuedTelegramUpdate {
+  return {
+    updateId: Number(row.update_id),
+    payload: String(row.payload),
+    attempts: Number(row.attempts),
+  };
+}
+
+function mapBroadcast(row: Record<string, unknown>): Broadcast {
+  const status = String(row.status);
+  if (!['draft', 'queued', 'running', 'paused', 'completed', 'cancelled'].includes(status)) {
+    throw new Error('broadcast status is invalid');
+  }
+  return {
+    id: String(row.id),
+    adminTelegramUserId: String(row.admin_telegram_user_id),
+    message: String(row.message),
+    status: status as Broadcast['status'],
+    targetCount: Number(row.target_count),
+    delivered: Number(row.delivered_count),
+    failed: Number(row.failed_count),
+    createdAt: parseDatabaseDate(row.created_at),
+    updatedAt: parseDatabaseDate(row.updated_at),
+    ...(row.completed_at ? { completedAt: parseDatabaseDate(row.completed_at) } : {}),
+  };
+}
+
+function mapQueuedBroadcastDelivery(row: Record<string, unknown>): QueuedBroadcastDelivery {
+  return {
+    broadcastId: String(row.broadcast_id),
+    telegramUserId: String(row.telegram_user_id),
+    chatId: String(row.chat_id),
+    message: String(row.message),
+    attempts: Number(row.attempts),
+  };
+}
+
+function uniqueBroadcastRecipients(recipients: BroadcastRecipient[]): BroadcastRecipient[] {
+  const unique = new Map<string, BroadcastRecipient>();
+  for (const recipient of recipients) {
+    if (!recipient.telegramUserId || !recipient.chatId) continue;
+    unique.set(recipient.telegramUserId, recipient);
+  }
+  return [...unique.values()];
 }
 
 function normalizeAuditMetadata(metadata: BotAuditMetadata | undefined): BotAuditMetadata {

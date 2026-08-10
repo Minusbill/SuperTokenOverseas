@@ -34,18 +34,18 @@ function messageUpdate(updateId: number, text: string): unknown {
   };
 }
 
-function callbackUpdate(updateId: number, callbackId: string, data: string): unknown {
+function callbackUpdate(updateId: number, callbackId: string, data: string, userId = 1001): unknown {
   return {
     update_id: updateId,
     callback_query: {
       id: callbackId,
-      from: { id: 1001, is_bot: false, first_name: 'Alice', language_code: 'zh' },
+      from: { id: userId, is_bot: false, first_name: 'Alice', language_code: 'zh' },
       chat_instance: 'test-chat-instance',
       data,
       message: {
         message_id: 99,
         date: 1,
-        chat: { id: 1001, type: 'private' },
+        chat: { id: userId, type: 'private' },
         from: { id: 9999, is_bot: true, first_name: 'Test', username: 'test_bot' },
         text: '菜单',
       },
@@ -53,7 +53,111 @@ function callbackUpdate(updateId: number, callbackId: string, data: string): unk
   };
 }
 
+async function seedActiveBinding(repository: MemoryRepository, telegramUserId: string, newApiUserId: number): Promise<void> {
+  await repository.upsertTelegramUser({ telegramUserId, chatId: telegramUserId, locale: 'zh' });
+  await repository.saveBinding({
+    telegramUserId,
+    newApiUserId,
+    usernameSnapshot: `user-${telegramUserId}`,
+    status: 'active',
+    verifiedAt: new Date('2026-08-09T00:00:00.000Z'),
+    lastVerifiedAt: new Date('2026-08-09T00:00:00.000Z'),
+  });
+}
+
 describe('telegram bot commands', () => {
+  it('creates a persistent broadcast draft and only queues it on confirmation', async () => {
+    const repository = new MemoryRepository();
+    await seedActiveBinding(repository, '1002', 43);
+    const sent: Array<{ chatId: string; text: string }> = [];
+    let wakes = 0;
+    const bot = createBot({
+      config: config({ BOT_ADMIN_TELEGRAM_IDS: '1001', BROADCAST_DELAY_MS: '0' }), repository,
+      logger: pino({ enabled: false }), newApi: {} as never, onBroadcastQueued: () => { wakes += 1; },
+    });
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === 'getMe') return { ok: true, result: { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' } } as never;
+      if (method === 'sendMessage') {
+        const input = payload as { chat_id?: string | number; text?: string };
+        sent.push({ chatId: String(input.chat_id), text: String(input.text ?? '') });
+      }
+      return { ok: true, result: method === 'sendMessage'
+        ? { message_id: 1, date: 1, chat: { id: 1001, type: 'private' }, text: (payload as { text?: string }).text ?? '' }
+        : true } as never;
+    });
+    await bot.init();
+
+    await bot.handleUpdate(messageUpdate(900, '/broadcast 维护通知') as never);
+    const broadcastId = sent.at(-1)?.text.match(/编号：(BC-[A-F0-9]{12})/)?.[1];
+    expect(broadcastId).toBeDefined();
+    expect(sent.at(-1)?.text).toContain('确认后由后台任务投递');
+    expect(await repository.getBroadcast(broadcastId!, '1001')).toMatchObject({ status: 'draft', targetCount: 1 });
+
+    await bot.handleUpdate(callbackUpdate(901, 'broadcast-confirm', `broadcast:confirm:${broadcastId}`) as never);
+    expect(await repository.getBroadcast(broadcastId!, '1001')).toMatchObject({ status: 'queued', targetCount: 1 });
+    expect(sent.filter((item) => item.chatId === '1002')).toHaveLength(0);
+    expect(wakes).toBe(1);
+  });
+
+  it('does not allow another whitelisted administrator to control a broadcast they do not own', async () => {
+    const repository = new MemoryRepository();
+    await repository.createBroadcastDraft({
+      id: 'BC-0123456789AB', adminTelegramUserId: '1001', message: '维护通知', recipients: [],
+    });
+    const sent: string[] = [];
+    const bot = createBot({
+      config: config({ BOT_ADMIN_TELEGRAM_IDS: '1001,2002' }), repository, logger: pino({ enabled: false }), newApi: {} as never,
+    });
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === 'getMe') return { ok: true, result: { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' } } as never;
+      if (method === 'sendMessage') sent.push(String((payload as { text?: string }).text ?? ''));
+      return { ok: true, result: method === 'sendMessage'
+        ? { message_id: 1, date: 1, chat: { id: 2002, type: 'private' }, text: (payload as { text?: string }).text ?? '' }
+        : true } as never;
+    });
+    await bot.init();
+
+    await bot.handleUpdate(callbackUpdate(902, 'broadcast-other-admin', 'broadcast:confirm:BC-0123456789AB', 2002) as never);
+
+    expect(await repository.getBroadcast('BC-0123456789AB', '1001')).toMatchObject({ status: 'draft' });
+    expect(sent.at(-1)).toContain('广播不存在、无权操作');
+  });
+
+  it('shows pause and resume state without synchronously delivering the broadcast', async () => {
+    const repository = new MemoryRepository();
+    await repository.createBroadcastDraft({
+      id: 'BC-ABCDEF012345', adminTelegramUserId: '1001', message: '维护通知',
+      recipients: [{ telegramUserId: '1002', chatId: '1002' }],
+    });
+    await repository.queueBroadcast('BC-ABCDEF012345', '1001');
+    const sent: Array<{ chatId: string; text: string }> = [];
+    let wakes = 0;
+    const bot = createBot({
+      config: config({ BOT_ADMIN_TELEGRAM_IDS: '1001' }), repository, logger: pino({ enabled: false }), newApi: {} as never,
+      onBroadcastQueued: () => { wakes += 1; },
+    });
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === 'getMe') return { ok: true, result: { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' } } as never;
+      if (method === 'sendMessage') {
+        const input = payload as { chat_id?: string | number; text?: string };
+        sent.push({ chatId: String(input.chat_id), text: String(input.text ?? '') });
+      }
+      return { ok: true, result: method === 'sendMessage'
+        ? { message_id: 1, date: 1, chat: { id: 1001, type: 'private' }, text: (payload as { text?: string }).text ?? '' }
+        : true } as never;
+    });
+    await bot.init();
+
+    await bot.handleUpdate(callbackUpdate(903, 'broadcast-pause', 'broadcast:pause:BC-ABCDEF012345') as never);
+    expect(await repository.getBroadcast('BC-ABCDEF012345', '1001')).toMatchObject({ status: 'paused' });
+    expect(sent.at(-1)?.text).toContain('广播已暂停');
+    await bot.handleUpdate(callbackUpdate(904, 'broadcast-resume', 'broadcast:resume:BC-ABCDEF012345') as never);
+    expect(await repository.getBroadcast('BC-ABCDEF012345', '1001')).toMatchObject({ status: 'queued' });
+    expect(sent.at(-1)?.text).toContain('广播已恢复');
+    expect(sent.filter((item) => item.chatId === '1002')).toHaveLength(0);
+    expect(wakes).toBe(1);
+  });
+
   it('binds through the Bridge and deduplicates a repeated update', async () => {
     const repository = new MemoryRepository();
     const sent: string[] = [];
@@ -136,9 +240,16 @@ describe('telegram bot commands', () => {
       repository,
       logger: pino({ enabled: false }),
       newApi: {
+        getStatus: async () => ({ ...status, quotaDisplayType: 'CNY', usdExchangeRate: 7.2 }),
         getPublicModels: async () => {
           publicModelCalls += 1;
-          return { total: 2, models: [{ id: 'gpt-5.6-sol', endpointTypes: ['openai'] }] };
+          return {
+            total: 2,
+            models: [{
+              id: 'gpt-5.6-sol', endpointTypes: ['openai'],
+              cataloguePrice: { kind: 'token', inputUsdPerMillion: 1, outputUsdPerMillion: 8 },
+            }],
+          };
         },
         getAvailableModels: async () => { throw new Error('Bridge model endpoint must not be called'); },
         getApiAccess: async () => { throw new Error('Bridge key endpoint must not be called'); },
@@ -160,6 +271,8 @@ describe('telegram bot commands', () => {
 
     expect(publicModelCalls).toBe(1);
     expect(sent.some((item) => item.text.includes('公开模型目录'))).toBe(true);
+    expect(sent.some((item) => item.text.includes('公开最低价：¥7.2 / ¥57.6 / 1M tokens'))).toBe(true);
+    expect(sent.some((item) => item.text.includes('不是账号报价'))).toBe(true);
     expect(sent.some((item) => item.text.includes('原生 new-api'))).toBe(true);
     const apiAccess = sent.find((item) => item.text.startsWith('API 接入'));
     expect(apiAccess).toBeDefined();
@@ -404,7 +517,7 @@ describe('telegram bot commands', () => {
     expect(createCalls).toBe(1);
     expect(photos).toHaveLength(0);
     expect(sent.some((text) => text.includes('链上充值订单已创建'))).toBe(true);
-    expect(sent.some((text) => text.includes('Mock 地址不会接收'))).toBe(true);
+    expect(sent.some((text) => text.includes('Mock 测试地址'))).toBe(true);
     expect(sent.some((text) => text.includes('网络：Base'))).toBe(true);
     expect(sent.some((text) => text.includes('转账金额：50.010000 USDT'))).toBe(true);
     expect(sent.some((text) => text.includes('0x3333333333333333333333333333333333333333'))).toBe(true);
@@ -507,5 +620,136 @@ describe('telegram bot commands', () => {
     expect(sent.some((message) => message.text.includes('API Key #8 已删除'))).toBe(true);
     expect(sent.some((message) => JSON.stringify(message.payload).includes(access.keyManagementUrl))).toBe(true);
     expect(sent.map((message) => `${message.text}\n${JSON.stringify(message.payload)}`).join('\n')).not.toContain(rawKey);
+  });
+
+  it('treats new-api quota as the available balance and converts notification input from display units', async () => {
+    const repository = new MemoryRepository();
+    const sent: string[] = [];
+    const bot = createBot({
+      config: config(), repository, logger: pino({ enabled: false }),
+      newApi: {
+        getStatus: async () => status,
+        resolveAccountByTelegramId: async () => account,
+      } as never,
+    });
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === 'getMe') return { ok: true, result: { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' } } as never;
+      if (method === 'sendMessage') sent.push(String((payload as { text?: string }).text ?? ''));
+      return { ok: true, result: method === 'sendMessage'
+        ? { message_id: 1, date: 1, chat: { id: 1001, type: 'private' }, text: (payload as { text?: string }).text ?? '' }
+        : true } as never;
+    });
+    await bot.init();
+
+    await bot.handleUpdate(messageUpdate(60, '/account') as never);
+    await bot.handleUpdate(messageUpdate(61, '/notify 50') as never);
+
+    expect(sent.some((text) => text.includes('当前余额：$1.00'))).toBe(true);
+    expect(sent.some((text) => text.includes('历史已用：$0.0020'))).toBe(true);
+    expect(sent.some((text) => text.includes('剩余额度'))).toBe(false);
+    expect((await repository.getNotificationPreference('1001')).lowQuotaThreshold).toBe(25_000_000);
+    expect(sent.some((text) => text.includes('低余额阈值：$50.00'))).toBe(true);
+  });
+
+  it('releases a failed webhook update so Telegram can retry the same update ID', async () => {
+    const repository = new MemoryRepository();
+    const originalUpsert = repository.upsertTelegramUser.bind(repository);
+    let fail = true;
+    repository.upsertTelegramUser = async (user) => {
+      if (fail) {
+        fail = false;
+        throw new Error('temporary database failure');
+      }
+      return originalUpsert(user);
+    };
+    const sent: string[] = [];
+    const bot = createBot({
+      config: config({ BOT_MODE: 'webhook', PUBLIC_BASE_URL: 'https://bot.example.test' }),
+      repository,
+      logger: pino({ enabled: false }),
+      newApi: {} as never,
+    });
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === 'getMe') return { ok: true, result: { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' } } as never;
+      if (method === 'sendMessage') sent.push(String((payload as { text?: string }).text ?? ''));
+      return { ok: true, result: method === 'sendMessage'
+        ? { message_id: 1, date: 1, chat: { id: 1001, type: 'private' }, text: (payload as { text?: string }).text ?? '' }
+        : true } as never;
+    });
+    await bot.init();
+    const update = messageUpdate(62, '/start');
+
+    await expect(bot.handleUpdate(update as never)).rejects.toThrow('temporary database failure');
+    await expect(bot.handleUpdate(update as never)).resolves.toBeUndefined();
+    expect(sent.some((text) => text.includes('欢迎使用 SuperToken'))).toBe(true);
+  });
+
+  it('rate limits repeated account binding attempts by Telegram ID', async () => {
+    const repository = new MemoryRepository();
+    const sent: string[] = [];
+    let resolveCalls = 0;
+    const bot = createBot({
+      config: config(), repository, logger: pino({ enabled: false }),
+      newApi: {
+        resolveAccountByTelegramId: async () => {
+          resolveCalls += 1;
+          return account;
+        },
+      } as never,
+    });
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === 'getMe') return { ok: true, result: { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' } } as never;
+      if (method === 'sendMessage') sent.push(String((payload as { text?: string }).text ?? ''));
+      return { ok: true, result: method === 'sendMessage'
+        ? { message_id: 1, date: 1, chat: { id: 1001, type: 'private' }, text: (payload as { text?: string }).text ?? '' }
+        : true } as never;
+    });
+    await bot.init();
+
+    for (let updateId = 80; updateId < 86; updateId += 1) {
+      await bot.handleUpdate(messageUpdate(updateId, '/bind') as never);
+    }
+
+    expect(resolveCalls).toBe(5);
+    expect(sent.some((text) => text.includes('操作过于频繁'))).toBe(true);
+  });
+
+  it('renders the Bridge mock checkout in English with an explicit no-payment warning', async () => {
+    const repository = new MemoryRepository();
+    const sent: string[] = [];
+    const bot = createBot({
+      config: config(), repository, logger: pino({ enabled: false }),
+      newApi: {
+        getTopUpOptions: async () => ({
+          enabled: true, displayType: 'USD', minTopup: 50, amountOptions: [50],
+          paymentMethods: [{ type: 'alipay', name: 'Alipay' }],
+        }),
+        quoteTopUp: async () => ({ topupAmount: 50, paymentMethod: 'alipay', payableAmount: '365.00', expiresIn: 900 }),
+        createTopUp: async () => ({
+          orderRef: 'MOCKEN1', status: 'pending', topupAmount: 50, paymentMethod: 'alipay',
+          payableAmount: '365.00', checkoutUrl: 'https://checkout.example.test/mock', expiresAt: 1_800_000_000,
+        }),
+      } as never,
+    });
+    bot.api.config.use(async (_previous, method, payload) => {
+      if (method === 'getMe') return { ok: true, result: { id: 1, is_bot: true, first_name: 'Test', username: 'test_bot' } } as never;
+      if (method === 'sendMessage') sent.push(String((payload as { text?: string }).text ?? ''));
+      return { ok: true, result: method === 'sendMessage'
+        ? { message_id: 1, date: 1, chat: { id: 1001, type: 'private' }, text: (payload as { text?: string }).text ?? '' }
+        : method === 'sendPhoto'
+          ? { message_id: 2, date: 1, chat: { id: 1001, type: 'private' }, photo: [] }
+          : true } as never;
+    });
+    await bot.init();
+
+    await bot.handleUpdate(callbackUpdate(70, 'language-en-mock', 'language:en') as never);
+    await bot.handleUpdate(messageUpdate(71, '/topup') as never);
+    await bot.handleUpdate(callbackUpdate(72, 'amount-en-mock', 'topup:amount:50') as never);
+    await bot.handleUpdate(callbackUpdate(73, 'quote-en-mock', 'topup:quote:50:alipay') as never);
+    await bot.handleUpdate(callbackUpdate(74, 'create-en-mock', 'topup:create:50:alipay') as never);
+
+    expect(sent.some((text) => text.includes('Pending order created'))).toBe(true);
+    expect(sent.some((text) => text.includes('Mock order. Do not make a real payment.'))).toBe(true);
+    expect(sent.some((text) => text.includes('待支付订单'))).toBe(false);
   });
 });

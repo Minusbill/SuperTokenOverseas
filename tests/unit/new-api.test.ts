@@ -116,18 +116,35 @@ describe('NewApiClient', () => {
       response.setHeader('content-type', 'application/json');
       response.end(JSON.stringify({
         success: true,
-        data: {
-          models: [
-            { model_name: 'gpt-5.6-sol', supported_endpoint_types: ['openai'] },
-            { model_name: 'claude-opus-5', supported_endpoint_types: ['anthropic', 'openai'] },
-          ],
-        },
+        data: [
+          {
+            model_name: 'gpt-5.6-sol', supported_endpoint_types: ['openai'], quota_type: 0,
+            model_ratio: 0.625, completion_ratio: 8, enable_groups: ['default'],
+          },
+          {
+            model_name: 'claude-opus-5', supported_endpoint_types: ['anthropic', 'openai'], quota_type: 1,
+            model_price: 0.05, enable_groups: ['default'],
+          },
+          {
+            model_name: 'veo-3', quota_type: 0, model_ratio: 1, completion_ratio: 1,
+            billing_mode: 'tiered_expr', billing_expr: 'inputPrice=1', enable_groups: ['default'],
+          },
+        ],
+        group_ratio: { default: 0.8 },
       }));
     });
 
     const models = await new NewApiClient(config(baseUrl, 'admin'), logger).getPublicModels();
-    expect(models.total).toBe(2);
-    expect(models.models[0]).toEqual({ id: 'gpt-5.6-sol', endpointTypes: ['openai'] });
+    expect(models.total).toBe(3);
+    expect(models.models[0]).toEqual({
+      id: 'gpt-5.6-sol', endpointTypes: ['openai'],
+      cataloguePrice: { kind: 'token', inputUsdPerMillion: 1, outputUsdPerMillion: 8 },
+    });
+    expect(models.models[1]?.cataloguePrice).toMatchObject({ kind: 'request' });
+    expect(models.models[1]?.cataloguePrice?.kind === 'request'
+      ? models.models[1].cataloguePrice.usdPerRequest
+      : undefined).toBeCloseTo(0.04, 12);
+    expect(models.models[2]?.cataloguePrice).toEqual({ kind: 'dynamic' });
     expect(authorization).toBeUndefined();
   });
 
@@ -218,6 +235,29 @@ describe('NewApiClient', () => {
       { path: '/api/integrations/telegram/v1/topup/orders', body: '{"telegram_id":"1001","amount":10,"payment_method":"alipay","idempotency_key":"callback-123"}' },
       { path: '/api/integrations/telegram/v1/topup/status', body: '{"telegram_id":"1001","order_ref":"TGUSR42NO1234567890"}' },
     ]);
+  });
+
+  it('normalizes a disabled Bridge payment method list serialized as null', async () => {
+    const baseUrl = await startServer((request, response) => {
+      let body = '';
+      request.setEncoding('utf8');
+      request.on('data', (chunk: string) => { body += chunk; });
+      request.on('end', () => {
+        assertBridgeSignature(request, body);
+        response.setHeader('content-type', 'application/json');
+        response.end(JSON.stringify({ success: true, data: {
+          enabled: false, display_type: 'USD', min_topup: 1, amount_options: [10, 20], payment_methods: null,
+        } }));
+      });
+    });
+
+    await expect(new NewApiClient(config(baseUrl), logger).getTopUpOptions('1001')).resolves.toEqual({
+      enabled: false,
+      displayType: 'USD',
+      minTopup: 1,
+      amountOptions: [10, 20],
+      paymentMethods: [],
+    });
   });
 
   it('parses a paged model list and a multi-chain stablecoin order without relaxing fiat contracts', async () => {
